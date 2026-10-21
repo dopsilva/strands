@@ -1,0 +1,210 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- tools/calculator — evaluates math expressions (no code runs: a small
+-- parser of its own)
+--
+--   2 + 3 * (4 - 1)^2      sqrt(1764)      sin(pi / 2)      10 // 3      7 % 4
+--   functions: sqrt abs exp ln log log10 log2 sin cos tan asin acos atan
+--              floor ceil round min max pow hypot factorial
+--   constants: pi e tau
+
+local tools_mod = require("../tools")
+
+local M = {}
+
+local FUNCS = {
+    sqrt = function(a) return math.sqrt(a[0]) end,
+    abs = function(a) return math.abs(a[0]) end,
+    exp = function(a) return math.exp(a[0]) end,
+    ln = function(a) return math.log(a[0]) end,
+    log = function(a) return len(a) > 1 and math.log(a[0]) / math.log(a[1]) or math.log(a[0]) / math.log(10) end,
+    log10 = function(a) return math.log(a[0]) / math.log(10) end,
+    log2 = function(a) return math.log(a[0]) / math.log(2) end,
+    sin = function(a) return math.sin(a[0]) end,
+    cos = function(a) return math.cos(a[0]) end,
+    tan = function(a) return math.tan(a[0]) end,
+    asin = function(a) return math.asin(a[0]) end,
+    acos = function(a) return math.acos(a[0]) end,
+    atan = function(a) return math.atan(a[0]) end,
+    floor = function(a) return math.floor(a[0]) end,
+    ceil = function(a) return math.ceil(a[0]) end,
+    round = function(a)
+        local d = len(a) > 1 and a[1] or 0
+        local f = 10 ^ d
+        return math.floor(a[0] * f + 0.5) / f
+    end,
+    min = function(a) return list.min(a) end,
+    max = function(a) return list.max(a) end,
+    pow = function(a) return a[0] ^ a[1] end,
+    hypot = function(a) return math.sqrt(a[0] * a[0] + a[1] * a[1]) end,
+    factorial = function(a)
+        local n = math.floor(a[0])
+        if n < 0 or n > 170 then return error("factorial needs 0 <= n <= 170") end
+        local r = 1
+        for i = 2, n do r *= i end
+        return r
+    end,
+}
+
+local CONSTS = {pi = math.pi, e = math.exp(1), tau = 2 * math.pi}
+
+local function tokenize(s)
+    local toks = []
+    local i = 1
+    local n = len(s)
+    while i <= n do
+        local ch = string.sub(s, i, i)
+        if string.contains(" \t\n", ch) then
+            i += 1
+        else
+            local m = re.captures("^([0-9]+\\.?[0-9]*(?:[eE][-+]?[0-9]+)?|\\.[0-9]+)", string.sub(s, i))
+            if m ~= nil then
+                toks[] = {kind = "num", value = tonumber(m[1])}
+                i += len(m[1])
+            else
+                local w = re.captures("^([A-Za-z_][A-Za-z0-9_]*)", string.sub(s, i))
+                if w ~= nil then
+                    toks[] = {kind = "name", value = w[1]}
+                    i += len(w[1])
+                elseif string.sub(s, i, i + 1) == "//" or string.sub(s, i, i + 1) == "**" then
+                    toks[] = {kind = "op", value = string.sub(s, i, i + 1)}
+                    i += 2
+                elseif string.contains("+-*/%^(),", ch) then
+                    toks[] = {kind = "op", value = ch}
+                    i += 1
+                else
+                    return error(`unexpected '${ch}' at position ${i}`)
+                end
+            end
+        end
+    end
+    return toks
+end
+
+-- recursive descent: expr = term {(+|-) term}; term = unary {(*|/|//|%) unary};
+-- unary = (-|+) unary | power; power = atom [(^|**) unary]
+function M.evaluate(src)
+    local toks = tokenize(src)?
+    local pos = 0
+    local function peek() return toks[pos] end
+    local function is_op(v)
+        local t = toks[pos]
+        return t ~= nil and t.kind == "op" and t.value == v
+    end
+    local expr
+    local function atom()
+        local t = toks[pos]
+        if t == nil then return error("unexpected end of expression") end
+        pos += 1
+        if t.kind == "num" then return t.value end
+        if t.kind == "op" and t.value == "(" then
+            local v = expr()?
+            if not is_op(")") then return error("missing ')'") end
+            pos += 1
+            return v
+        end
+        if t.kind == "name" then
+            if is_op("(") then
+                local f = FUNCS[t.value]
+                if f == nil then return error(`unknown function '${t.value}'`) end
+                pos += 1
+                local args = []
+                if not is_op(")") then
+                    while true do
+                        args[] = expr()?
+                        if is_op(",") then pos += 1 else break end
+                    end
+                end
+                if not is_op(")") then return error(`missing ')' after the arguments of ${t.value}`) end
+                pos += 1
+                if len(args) == 0 then return error(`${t.value} needs arguments`) end
+                return f(args)
+            end
+            local c = CONSTS[t.value]
+            if c == nil then return error(`unknown name '${t.value}'`) end
+            return c
+        end
+        return error(`unexpected '${t.value}'`)
+    end
+    local unary
+    local function power()
+        local base = atom()?
+        if is_op("^") or is_op("**") then
+            pos += 1
+            local ex = unary()?
+            return base ^ ex
+        end
+        return base
+    end
+    unary = function()
+        if is_op("-") then
+            pos += 1
+            local v = unary()?
+            return -v
+        end
+        if is_op("+") then
+            pos += 1
+            return unary()
+        end
+        return power()
+    end
+    local function term()
+        local v = unary()?
+        while is_op("*") or is_op("/") or is_op("//") or is_op("%") do
+            local op = peek().value
+            pos += 1
+            local r = unary()?
+            if (op == "/" or op == "//" or op == "%") and r == 0 then return error("division by zero") end
+            if op == "*" then
+                v = v * r
+            elseif op == "/" then
+                v = v / r
+            elseif op == "//" then
+                v = math.floor(v / r)
+            else
+                v = v % r
+            end
+        end
+        return v
+    end
+    expr = function()
+        local v = term()?
+        while is_op("+") or is_op("-") do
+            local op = peek().value
+            pos += 1
+            local r = term()?
+            v = op == "+" and v + r or v - r
+        end
+        return v
+    end
+    local v = expr()?
+    if pos < len(toks) then return error(`unexpected '${toks[pos].value}'`) end
+    return v
+end
+
+local function format_number(v, precision)
+    if type(v) == "int" then return tostring(v) end
+    if v == math.floor(v) and math.abs(v) < 1e15 then return tostring(math.floor(v)) end
+    local s = string.format(`%.${precision}f`, v)
+    s = re.gsub("0+$", s, "")
+    s = re.gsub("\\.$", s, "")
+    return s
+end
+
+M.calculator = tools_mod.tool({
+    name = "calculator",
+    description = "Evaluate a math expression: + - * / // % ^, parentheses, sqrt, sin, cos, tan, log, ln, exp, abs, round, floor, ceil, min, max, pow, factorial; constants pi, e, tau.",
+    inputs = {
+        expression = {type = "string", description = "The expression, e.g. \"sqrt(1764) + 2^10\""},
+        precision = {type = "integer", description = "Decimal places in the result", default = 10},
+    },
+    fn = function(input)
+        local v = M.evaluate(input.expression)
+        if is_error(v) then return error(`cannot evaluate '${input.expression}': ${v.message}`) end
+        if type(v) == "number" and (isnan(v) or isinf(v)) then return error(`'${input.expression}' is not a finite number`) end
+        return `${input.expression} = ${format_number(v, input.precision)}`
+    end,
+})
+
+return M

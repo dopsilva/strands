@@ -1,0 +1,22 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- tools/consent — ask before a tool changes something (shell, file writes)
+--
+-- As in strands_tools: the user is asked on the terminal unless the
+-- environment has BYPASS_TOOL_CONSENT=true, or the tool was built with its
+-- own confirm function (confirm(what) → bool).
+
+local M = {}
+
+function M.ask(what, confirm)
+    if confirm ~= nil then return confirm(what) == true end
+    if os.getenv("BYPASS_TOOL_CONSENT") == "true" then return true end
+    io.write(`\n${what}\nAllow? [y/N] `)
+    local answer = io.read("l")
+    if answer == nil then return false end
+    answer = string.lower(string.trim(answer))
+    return answer == "y" or answer == "yes" or answer == "s" or answer == "sim"
+end
+
+return M

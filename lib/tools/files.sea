@@ -1,0 +1,176 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- tools/files — file_read, file_write, editor
+--
+-- Each has a factory taking {root} (paths must stay under it; default: any
+-- path) and, for the writing ones, {confirm} (see consent.sea).
+
+local tools_mod = require("../tools")
+local consent = require("./consent")
+
+local M = {}
+
+local function resolve(root, p)
+    if p == nil or p == "" then return error("a path is required") end
+    if string.starts_with(p, "~/") then p = path.join(os.getenv("HOME") or "", string.sub(p, 3)) end
+    local full = path.abs(root ~= nil and path.join(root, p) or p)
+    if root ~= nil then
+        local r = path.abs(root)
+        if full ~= r and not string.starts_with(full, r .. "/") then return error(`'${p}' is outside ${r}`) end
+    end
+    return full
+end
+
+local function numbered(lines, first)
+    local out = []
+    for i, l in lines do out[] = string.format("%6d  %s", first + i + 1, l) end
+    return string.join(out, "\n")
+end
+
+function M.file_read_tool(opts)
+    opts = opts or {}
+    return tools_mod.tool({
+        name = "file_read",
+        description = "Read files. mode \"view\": the file (or lines start_line..end_line) with line numbers; \"find\": files matching a glob pattern; \"search\": lines containing a text; \"stats\": size and line count; \"list\": a directory's entries.",
+        inputs = {
+            path = {type = "string", description = "File, directory or glob pattern"},
+            mode = {type = "string", enum = ["view", "find", "search", "stats", "list"], default = "view"},
+            start_line = {type = "integer", optional = true},
+            end_line = {type = "integer", optional = true},
+            search = {type = "string", description = "Text to search (mode search)", optional = true},
+        },
+        fn = function(input)
+            if input.mode == "find" then
+                local pat = input.path
+                if opts.root ~= nil then pat = path.join(opts.root, pat) end
+                local found = fs.glob(pat)?
+                if len(found) == 0 then return "No files found" end
+                return string.join(found, "\n")
+            end
+            local p = resolve(opts.root, input.path)?
+            if input.mode == "list" then
+                if not fs.isdir(p) then return error(`${input.path} is not a directory`) end
+                local names = fs.list(p)?
+                local out = []
+                for _, n in names do out[] = fs.isdir(path.join(p, n)) and n .. "/" or n end
+                return string.join(out, "\n")
+            end
+            if not fs.isfile(p) then return error(`${input.path} is not a file`) end
+            local text = fs.read(p)?
+            local lines = string.splitlines(text)
+            if input.mode == "stats" then
+                return `${input.path}: ${len(text)} bytes, ${len(lines)} lines`
+            end
+            if input.mode == "search" then
+                if input.search == nil then return error("mode search needs search") end
+                local hits = []
+                for i, l in lines do
+                    if string.contains(l, input.search) then hits[] = string.format("%6d  %s", i + 1, l) end
+                end
+                if len(hits) == 0 then return `'${input.search}' not found in ${input.path}` end
+                return string.join(hits, "\n")
+            end
+            local first = (input.start_line or 1) - 1
+            if first < 0 then first = 0 end
+            local last = input.end_line or len(lines)
+            local max_lines = opts.max_lines or 2000
+            if last - first > max_lines then last = first + max_lines end
+            return numbered(list.slice(lines, first, last), first)
+        end,
+    })
+end
+
+function M.file_write_tool(opts)
+    opts = opts or {}
+    return tools_mod.tool({
+        name = "file_write",
+        description = "Write a file (create or replace; append = true adds to its end). Missing directories are created.",
+        inputs = {
+            path = {type = "string"},
+            content = {type = "string"},
+            append = {type = "boolean", default = false},
+        },
+        fn = function(input)
+            local p = resolve(opts.root, input.path)?
+            local what = `The agent wants to ${input.append and "append to" or "write"} ${p} (${len(input.content)} bytes)`
+            if not consent.ask(what, opts.confirm) then return error("the user did not allow this write") end
+            fs.mkdir(path.dirname(p), {parents = true})?
+            if input.append then fs.append(p, input.content)? else fs.write(p, input.content)? end
+            return `Wrote ${len(input.content)} bytes to ${input.path}`
+        end,
+    })
+end
+
+-- editor: view, create, str_replace (one exact match), insert (after a
+-- line), undo_edit (the last change made by this tool to that file)
+function M.editor_tool(opts)
+    opts = opts or {}
+    local history = {}
+    return tools_mod.tool({
+        name = "editor",
+        description = "Edit text files. command \"view\" (with line numbers), \"create\" (file_text), \"str_replace\" (old_str must occur exactly once; new_str replaces it), \"insert\" (new_str after insert_line; 0 = at the top), \"undo_edit\".",
+        inputs = {
+            command = {type = "string", enum = ["view", "create", "str_replace", "insert", "undo_edit"]},
+            path = {type = "string"},
+            file_text = {type = "string", optional = true},
+            old_str = {type = "string", optional = true},
+            new_str = {type = "string", optional = true},
+            insert_line = {type = "integer", optional = true},
+        },
+        fn = function(input)
+            local p = resolve(opts.root, input.path)?
+            local cmd = input.command
+            if cmd == "view" then
+                if not fs.isfile(p) then return error(`${input.path} does not exist`) end
+                return numbered(string.splitlines(fs.read(p)?), 0)
+            end
+            local function save(new_text, what)
+                if not consent.ask(`The agent wants to ${what} ${p}`, opts.confirm) then
+                    return error("the user did not allow this edit")
+                end
+                if fs.isfile(p) then history[p] = fs.read(p)? else history[p] = nil end
+                fs.mkdir(path.dirname(p), {parents = true})?
+                return fs.write(p, new_text)
+            end
+            if cmd == "create" then
+                if input.file_text == nil then return error("create needs file_text") end
+                save(input.file_text, "create")?
+                return `Created ${input.path}`
+            end
+            if cmd == "undo_edit" then
+                local old = history[p]
+                if old == nil then return error(`no edit of ${input.path} to undo`) end
+                fs.write(p, old)?
+                history[p] = nil
+                return `Reverted the last edit of ${input.path}`
+            end
+            if not fs.isfile(p) then return error(`${input.path} does not exist`) end
+            local text = fs.read(p)?
+            if cmd == "str_replace" then
+                if input.old_str == nil or input.old_str == "" then return error("str_replace needs old_str") end
+                local count = len(string.split(text, input.old_str)) - 1
+                if count == 0 then return error("old_str was not found") end
+                if count > 1 then return error(`old_str occurs ${count} times; make it unique`) end
+                save(string.replace(text, input.old_str, input.new_str or ""), "edit")?
+                return `Edited ${input.path}`
+            end
+            if cmd == "insert" then
+                if input.new_str == nil or input.insert_line == nil then return error("insert needs new_str and insert_line") end
+                local lines = string.splitlines(text)
+                if input.insert_line < 0 or input.insert_line > len(lines) then return error(`insert_line must be 0..${len(lines)}`) end
+                local out = list.concat(list.slice(lines, 0, input.insert_line), string.splitlines(input.new_str), list.slice(lines, input.insert_line))
+                local trailing = string.ends_with(text, "\n") and "\n" or ""
+                save(string.join(out, "\n") .. trailing, "insert into")?
+                return `Inserted after line ${input.insert_line} of ${input.path}`
+            end
+            return error(`unknown command ${cmd}`)
+        end,
+    })
+end
+
+M.file_read = M.file_read_tool()
+M.file_write = M.file_write_tool()
+M.editor = M.editor_tool()
+
+return M

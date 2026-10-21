@@ -1,0 +1,144 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- tools/system — current_time, environment, sleep, shell, http_request
+
+local tools_mod = require("../tools")
+local consent = require("./consent")
+local deps = require("../deps")
+
+local M = {}
+
+M.current_time = tools_mod.tool({
+    name = "current_time",
+    description = "The current date and time (ISO 8601), in a time zone (IANA name like America/Sao_Paulo, or UTC; default: the local zone).",
+    inputs = {timezone = {type = "string", description = "IANA time zone", optional = true}},
+    fn = function(input)
+        local t = time.now()
+        if input.timezone ~= nil and input.timezone ~= "" then
+            t = t:in_zone(input.timezone)
+            if is_error(t) then return error(`unknown time zone '${input.timezone}'`) end
+        end
+        return t:iso()
+    end,
+})
+
+-- environment: read variables (writing needs consent); names that look
+-- like secrets are masked
+local SECRET = "(?i)(key|token|secret|password|passwd|credential)"
+
+function M.environment_tool(opts)
+    opts = opts or {}
+    return tools_mod.tool({
+        name = "environment",
+        description = "Read environment variables: action \"get\" (one name) or \"list\" (names with a prefix). Values of secret-looking names are masked.",
+        inputs = {
+            action = {type = "string", enum = ["get", "list"]},
+            name = {type = "string", description = "Variable name (get)", optional = true},
+            prefix = {type = "string", description = "Name prefix (list)", optional = true},
+        },
+        fn = function(input)
+            if input.action == "get" then
+                if input.name == nil then return error("get needs name") end
+                local v = os.getenv(input.name)
+                if v == nil then return `${input.name} is not set` end
+                if re.match(SECRET, input.name) ~= nil and not opts.show_secrets then v = "****" end
+                return `${input.name}=${v}`
+            end
+            local r = process.run(["env"])
+            if is_error(r) then return r end
+            local out = []
+            for _, line in string.splitlines(r.stdout) do
+                local name = string.split(line, "=", 2)[0]
+                if input.prefix == nil or string.starts_with(name, input.prefix) then out[] = name end
+            end
+            sort.sort(out)
+            return string.join(out, "\n")
+        end,
+    })
+end
+M.environment = M.environment_tool()
+
+M.sleep = tools_mod.tool({
+    name = "sleep",
+    description = "Wait for a number of seconds (at most 300).",
+    inputs = {seconds = {type = "number", minimum = 0, maximum = 300}},
+    fn = function(input)
+        time.sleep(math.floor(input.seconds * 1000) * time.Millisecond)
+        return `Slept ${input.seconds} s`
+    end,
+})
+
+-- shell(opts) → tool; opts: cwd, timeout_ms (default 60000), confirm,
+-- max_output (bytes of output returned, default 20000)
+function M.shell_tool(opts)
+    opts = opts or {}
+    local max_out = opts.max_output or 20000
+    return tools_mod.tool({
+        name = "shell",
+        description = "Run a shell command (/bin/sh -c) and return its exit code, stdout and stderr.",
+        inputs = {
+            command = {type = "string", description = "The command line"},
+            cwd = {type = "string", description = "Working directory", optional = true},
+            timeout_ms = {type = "integer", description = "Kill the command after this many milliseconds", optional = true},
+        },
+        fn = function(input)
+            if not consent.ask(`The agent wants to run: ${input.command}`, opts.confirm) then
+                return error("the user did not allow this command")
+            end
+            local r = process.run(input.command, {cwd = input.cwd or opts.cwd, timeout = input.timeout_ms or opts.timeout_ms or 60000, stderr = "pipe"})
+            if is_error(r) then return r end
+            local function cut(s)
+                if len(s) > max_out then return string.sub(s, 1, max_out) .. `\n… (${len(s) - max_out} more bytes)` end
+                return s
+            end
+            local parts = [`exit code: ${tostring(r.code)}${r.timed_out and " (timed out)" or ""}`]
+            if r.stdout ~= "" then parts[] = "stdout:\n" .. cut(r.stdout) end
+            if r.stderr ~= "" then parts[] = "stderr:\n" .. cut(r.stderr) end
+            local out = {}
+            out.status = r.ok and "success" or "error"
+            out.content = string.join(parts, "\n")
+            return out
+        end,
+    })
+end
+M.shell = M.shell_tool()
+
+-- http_request(opts) → tool; opts: allowed_hosts (array; default any),
+-- max_body (bytes returned, default 50000)
+function M.http_request_tool(opts)
+    opts = opts or {}
+    local max_body = opts.max_body or 50000
+    return tools_mod.tool({
+        name = "http_request",
+        description = "Make an HTTP request and return the status, the main headers and the body.",
+        inputs = {
+            method = {type = "string", enum = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"], default = "GET"},
+            url = {type = "string", description = "http:// or https:// URL"},
+            headers = {type = "object", description = "Request headers", optional = true},
+            body = {type = "string", description = "Request body", optional = true},
+            json = {type = "object", description = "A JSON body (instead of body)", optional = true},
+        },
+        fn = function(input)
+            local u = deps.http.parse_url(input.url)
+            if u == nil or (u.scheme ~= "http" and u.scheme ~= "https") then return error(`invalid URL '${input.url}'`) end
+            if opts.allowed_hosts ~= nil and not list.contains(opts.allowed_hosts, u.host) then
+                return error(`host '${u.host}' is not allowed`)
+            end
+            local ro = {}
+            ro.headers = input.headers
+            ro.body = input.body
+            ro.json = input.json
+            ro.timeout = opts.timeout_ms or 30000
+            local r = deps.http.request(input.method, input.url, ro)
+            if r.status == 0 then return error(r.error) end
+            local body = r.body or ""
+            if len(body) > max_body then body = string.sub(body, 1, max_body) .. `\n… (${len(r.body) - max_body} more bytes)` end
+            local ct = r.headers["content-type"] or ""
+            return `HTTP ${r.status} ${r.reason}\nContent-Type: ${ct}\n\n${body}`
+        end,
+    })
+end
+M.http_request = M.http_request_tool()
+
+return M

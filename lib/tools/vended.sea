@@ -1,0 +1,41 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- tools/vended — ready-made tools (Strands' strands_tools), as
+-- strands.vended.<name>; the factories (strands.vended.shell_tool({...}))
+-- configure root directories, consent, timeouts and allowed hosts.
+
+local calculator = require("./calculator")
+local system = require("./system")
+local files = require("./files")
+local think = require("./think")
+
+local M = {}
+
+M.calculator = calculator.calculator
+M.evaluate = calculator.evaluate
+M.current_time = system.current_time
+M.environment = system.environment
+M.environment_tool = system.environment_tool
+M.sleep = system.sleep
+M.shell = system.shell
+M.shell_tool = system.shell_tool
+M.http_request = system.http_request
+M.http_request_tool = system.http_request_tool
+M.file_read = files.file_read
+M.file_read_tool = files.file_read_tool
+M.file_write = files.file_write
+M.file_write_tool = files.file_write_tool
+M.editor = files.editor
+M.editor_tool = files.editor_tool
+M.think = think.think
+
+-- every ready-made tool
+function M.all()
+    return [
+        M.calculator, M.current_time, M.environment, M.sleep, M.shell, M.http_request,
+        M.file_read, M.file_write, M.editor, M.think,
+    ]
+end
+
+return M

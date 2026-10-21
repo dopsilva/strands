@@ -24,6 +24,8 @@ local M = {}
 M.VERSION = "0.1.0"
 
 M.agent = agent_mod.agent
+M.vended = require("./lib/tools/vended")
+M.mcp = require("./lib/mcp")
 M.tool = tools.tool
 
 M.models = {}

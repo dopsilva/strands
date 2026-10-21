@@ -1,0 +1,39 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- tools/think — reflect on a problem in several cycles before answering
+--
+-- Each cycle asks a fresh copy of the calling agent (same model, no tools)
+-- to deepen the previous cycle's thinking; the last cycle's text returns.
+
+local tools_mod = require("../tools")
+
+local M = {}
+
+local SYSTEM = [[You are a careful thinker. Given a problem and the thinking so far, take it one step further: check the reasoning, explore what was missed, and get closer to a well-founded conclusion. Be concise and concrete. Answer in the language of the problem.]]
+
+M.think = tools_mod.tool({
+    name = "think",
+    description = "Think a problem through in several reflection cycles before answering. Use it for hard, multi-step or ambiguous questions.",
+    inputs = {
+        thought = {type = "string", description = "The problem or the current line of thought"},
+        cycle_count = {type = "integer", description = "Reflection cycles (1 to 5)", minimum = 1, maximum = 5, default = 2},
+        system_prompt = {type = "string", description = "Instructions for the thinking", optional = true},
+    },
+    fn = function(input, ctx)
+        local thinker = ctx.agent:spawn({tools = [], system_prompt = input.system_prompt or SYSTEM})
+        local current = input.thought
+        local notes = []
+        for i = 1, input.cycle_count do
+            local prompt = i == 1 and `Problem:\n${current}` or `Problem:\n${input.thought}\n\nThinking so far:\n${current}\n\nGo one step further.`
+            thinker.messages = []
+            local r = thinker:invoke(prompt)
+            if is_error(r) then return r end
+            current = r.text
+            notes[] = `Cycle ${i}:\n${current}`
+        end
+        return string.join(notes, "\n\n")
+    end,
+})
+
+return M

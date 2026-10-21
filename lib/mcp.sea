@@ -1,0 +1,336 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- mcp — tools from Model Context Protocol servers
+--
+--   local fs_server = strands.mcp.client({command = ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"]})
+--   local remote = strands.mcp.client({url = "https://example.com/mcp", headers = {Authorization = "Bearer ..."}})
+--   local agent = strands.agent({tools = [fs_server, remote]})   -- their tools join the agent's
+--   ...
+--   fs_server:stop()
+--
+-- Options:
+--   command        array (or shell string) of a server spoken to over stdio
+--   env, cwd       for the command
+--   url, headers   a server spoken to over Streamable HTTP
+--   prefix         prepended to every tool name ("fs_" → fs_read_file)
+--   allowed, rejected   tool names to keep / to leave out
+--   timeout        per request, in milliseconds (default 60000)
+-- The client starts on first use (client:start() starts it explicitly).
+-- Besides the tools: client:list_prompts(), client:get_prompt(name, args),
+-- client:list_resources(), client:read_resource(uri), client:call_tool(name, args).
+
+local util = require("./util")
+local tools_mod = require("./tools")
+local messages = require("./messages")
+local deps = require("./deps")
+
+local M = {}
+
+M.PROTOCOL_VERSION = "2025-06-18"
+
+local Client = {}
+
+function M.client(opts)
+    opts = opts or {}
+    if opts.command == nil and opts.url == nil then return error("strands: mcp.client needs command or url") end
+    local c = {}
+    c.opts = opts
+    c.prefix = opts.prefix or ""
+    c.timeout = opts.timeout or 60000
+    c.started = false
+    c.next_id = 0
+    c.pending = [=] -- id → channel (stdio)
+    c.mu = sync.mutex()
+    c.proc = nil
+    c.session_id = nil
+    c.server_info = nil
+    c.tool_cache = nil
+    return util.with_methods(c, Client)
+end
+
+-- ---- Transport: stdio ----
+
+local function stdio_reader(self)
+    local buf = ""
+    while true do
+        local chunk = self.proc:read(65536)
+        if is_error(chunk) or chunk == "" then break end
+        buf ..= chunk
+        while true do
+            local nl = string.find(buf, "\n")
+            if nl == nil then break end
+            local line = string.trim(string.sub(buf, 1, nl - 1))
+            buf = string.sub(buf, nl + 1)
+            if line ~= "" then
+                local msg = json.decode(line)
+                if not is_error(msg) and util.is_record(msg) and msg.id ~= nil and msg.method == nil then
+                    self.mu:acquire()
+                    local ch = self.pending[msg.id]
+                    del self.pending[msg.id]
+                    self.mu:release()
+                    if ch ~= nil then ch <- msg end
+                elseif not is_error(msg) and util.is_record(msg) and msg.id ~= nil and msg.method ~= nil then
+                    -- a request from the server (ping, roots/list...): answer what we can
+                    local reply = {}
+                    reply.jsonrpc = "2.0"
+                    reply.id = msg.id
+                    if msg.method == "ping" then
+                        reply.result = {}
+                    else
+                        local e = {}
+                        e.code = -32601
+                        e.message = "method not supported by the client"
+                        reply.error = e
+                    end
+                    self.proc:write(json.encode(reply) .. "\n")
+                end
+            end
+        end
+    end
+    -- the server went away: fail whoever still waits
+    self.mu:acquire()
+    for id, ch in self.pending do
+        local e = {}
+        e.code = -32000
+        e.message = "MCP server closed the connection"
+        local m = {}
+        m.id = id
+        m.error = e
+        ch <- m
+    end
+    self.pending = [=]
+    self.mu:release()
+end
+
+local function stdio_send(self, msg, expect_reply)
+    local ch = nil
+    if expect_reply then
+        ch = chan(1)
+        self.mu:acquire()
+        self.pending[msg.id] = ch
+        self.mu:release()
+    end
+    local w = self.proc:write(json.encode(msg) .. "\n")
+    if is_error(w) then return error(`MCP write failed: ${w.message}`) end
+    if not expect_reply then return true end
+    local reply, timed_out = util.with_timeout(function() return <-ch end, self.timeout, function()
+        local e = {}
+        e.code = -32001
+        e.message = "MCP request timed out"
+        local m = {}
+        m.id = msg.id
+        m.error = e
+        ch <- m
+    end)
+    return reply
+end
+
+-- ---- Transport: Streamable HTTP ----
+
+local function http_send(self, msg, expect_reply)
+    local headers = {}
+    for k, v in self.opts.headers or {} do headers[k] = v end
+    headers["Accept"] = "application/json, text/event-stream"
+    headers["MCP-Protocol-Version"] = M.PROTOCOL_VERSION
+    if self.session_id ~= nil then headers["Mcp-Session-Id"] = self.session_id end
+    local resp = deps.http.post(self.opts.url, nil, nil, {json = msg, headers = headers, timeout = self.timeout})
+    if resp.status == 0 then return error(`MCP HTTP: ${resp.error}`) end
+    local sid = resp.headers["mcp-session-id"]
+    if sid ~= nil then self.session_id = sid end
+    if not resp.ok and resp.status ~= 202 then return error(`MCP HTTP ${resp.status}: ${resp.body}`) end
+    if not expect_reply then return true end
+    local ctype = resp.headers["content-type"] or ""
+    if string.contains(ctype, "text/event-stream") then
+        -- the reply is one of the events
+        for _, line in string.split(resp.body, "\n") do
+            line = string.trim(line)
+            if string.starts_with(line, "data:") then
+                local m = json.decode(string.trim(string.sub(line, 6)))
+                if not is_error(m) and util.is_record(m) and m.id == msg.id then return m end
+            end
+        end
+        return error("MCP HTTP: no reply in the event stream")
+    end
+    local m = json.decode(resp.body)
+    if is_error(m) then return error(`MCP HTTP: bad JSON reply: ${m.message}`) end
+    return m
+end
+
+-- ---- JSON-RPC ----
+
+function Client.send(self, msg, expect_reply)
+    if self.opts.url ~= nil then return http_send(self, msg, expect_reply) end
+    return stdio_send(self, msg, expect_reply)
+end
+
+-- client:request(method, params) → result | error
+function Client.request(self, method, params)
+    if not self.started and method ~= "initialize" then self:start()? end
+    self.mu:acquire()
+    self.next_id += 1
+    local id = self.next_id
+    self.mu:release()
+    local msg = {}
+    msg.jsonrpc = "2.0"
+    msg.id = id
+    msg.method = method
+    msg.params = params or {}
+    local reply = self:send(msg, true)
+    if is_error(reply) then return reply end
+    if reply.error ~= nil then
+        return error(`MCP ${method}: ${reply.error.message or json.encode(reply.error)}`)
+    end
+    return reply.result
+end
+
+function Client.notify(self, method, params)
+    local msg = {}
+    msg.jsonrpc = "2.0"
+    msg.method = method
+    if params ~= nil then msg.params = params end
+    return self:send(msg, false)
+end
+
+-- client:start() → true | error — spawn (stdio) and the initialize handshake
+function Client.start(self)
+    if self.started then return true end
+    if self.opts.command ~= nil then
+        local p = process.spawn(self.opts.command, {env = self.opts.env, cwd = self.opts.cwd, stderr = self.opts.stderr or "null"})
+        if is_error(p) then return error(`strands: cannot start MCP server: ${p.message}`) end
+        self.proc = p
+        go stdio_reader(self)
+    end
+    self.started = true
+    local ci = {}
+    ci.name = "strands-sea"
+    ci.version = "0.1.0"
+    local params = {}
+    params.protocolVersion = M.PROTOCOL_VERSION
+    params.capabilities = {}
+    params.clientInfo = ci
+    local r = self:request("initialize", params)
+    if is_error(r) then
+        self:stop()
+        return r
+    end
+    self.server_info = r
+    self:notify("notifications/initialized", nil)
+    return true
+end
+
+function Client.stop(self)
+    if self.proc ~= nil then
+        self.proc:close_stdin()
+        process.kill(self.proc.pid)
+        self.proc:wait()
+        self.proc = nil
+    end
+    self.started = false
+    self.tool_cache = nil
+end
+
+-- every page of a list method
+local function list_all(self, method, key)
+    local out = []
+    local cursor = nil
+    while true do
+        local params = {}
+        if cursor ~= nil then params.cursor = cursor end
+        local r = self:request(method, params)?
+        for _, x in r[key] or [] do out[] = x end
+        cursor = r.nextCursor
+        if cursor == nil or cursor == "" then break end
+    end
+    return out
+end
+
+function Client.list_tools(self) return list_all(self, "tools/list", "tools") end
+function Client.list_prompts(self) return list_all(self, "prompts/list", "prompts") end
+function Client.list_resources(self) return list_all(self, "resources/list", "resources") end
+
+function Client.get_prompt(self, name, args)
+    local p = {}
+    p.name = name
+    p.arguments = args or {}
+    return self:request("prompts/get", p)
+end
+
+function Client.read_resource(self, uri)
+    local p = {}
+    p.uri = uri
+    return self:request("resources/read", p)
+end
+
+-- client:call_tool(name, args) → MCP result {content, isError, structuredContent}
+function Client.call_tool(self, name, args)
+    local p = {}
+    p.name = name
+    p.arguments = args or {}
+    return self:request("tools/call", p)
+end
+
+-- an MCP tool result as a strands tool result
+local function to_strands_result(r)
+    local blocks = []
+    for _, c in r.content or [] do
+        if c.type == "text" then
+            blocks[] = messages.text_block(c.text)
+        elseif c.type == "image" then
+            local src = {}
+            src.bytes = encoding.base64_decode(c.data or "")
+            local img = {}
+            img.format = string.split(c.mimeType or "image/png", "/")[-1]
+            img.source = src
+            local b = {}
+            b.image = img
+            blocks[] = b
+        elseif c.type == "resource" and c.resource ~= nil then
+            blocks[] = messages.text_block(c.resource.text or json.encode(c.resource))
+        else
+            local b = {}
+            b.json = c
+            blocks[] = b
+        end
+    end
+    if r.structuredContent ~= nil and len(blocks) == 0 then
+        local b = {}
+        b.json = r.structuredContent
+        blocks[] = b
+    end
+    if len(blocks) == 0 then blocks[] = messages.text_block("") end
+    local out = {}
+    out.status = r.isError and "error" or "success"
+    out.content = blocks
+    return out
+end
+
+-- client:tools() → strands tools for the server's tools (cached)
+function Client.tools(self)
+    if self.tool_cache ~= nil then return self.tool_cache end
+    local list_ = self:list_tools()?
+    local out = []
+    for _, t in list_ do
+        local keep = (self.opts.allowed == nil or list.contains(self.opts.allowed, t.name)) and
+            (self.opts.rejected == nil or not list.contains(self.opts.rejected, t.name))
+        if keep then
+            local remote = t.name
+            local schema = t.inputSchema or {type = "object", properties = {}}
+            local tool = tools_mod.tool({
+                name = self.prefix .. remote,
+                description = t.description or remote,
+                input_schema = schema,
+                fn = function(input, ctx)
+                    local r = self:call_tool(remote, input)
+                    if is_error(r) then return r end
+                    return to_strands_result(r)
+                end,
+            })?
+            out[] = tool
+        end
+    end
+    self.tool_cache = out
+    return out
+end
+
+return M

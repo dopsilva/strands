@@ -1,0 +1,66 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- A tiny MCP server over stdio, for the tests: tools echo and add, one
+-- prompt and one resource. Two pages of tools test the client's cursor.
+
+local function reply(id, result)
+    local m = {}
+    m.jsonrpc = "2.0"
+    m.id = id
+    m.result = result
+    io.write(json.encode(m) .. "\n")
+end
+
+local function fail(id, code, msg)
+    local e = {}
+    e.code = code
+    e.message = msg
+    local m = {}
+    m.jsonrpc = "2.0"
+    m.id = id
+    m.error = e
+    io.write(json.encode(m) .. "\n")
+end
+
+local ECHO = {name = "echo", description = "Echo the text back", inputSchema = {type = "object", properties = {text = {type = "string"}}, required = ["text"]}}
+local ADD = {name = "add", description = "Add two numbers", inputSchema = {type = "object", properties = {a = {type = "number"}, b = {type = "number"}}, required = ["a", "b"]}}
+
+while true do
+    local line = io.read("l")
+    if line == nil then break end
+    local msg = json.decode(line)
+    if not is_error(msg) and msg.method ~= nil then
+        local p = msg.params or {}
+        if msg.method == "initialize" then
+            reply(msg.id, {protocolVersion = p.protocolVersion, capabilities = {tools = {}}, serverInfo = {name = "test-server", version = "1.0"}})
+        elseif msg.method == "notifications/initialized" then
+            -- nothing to answer
+        elseif msg.method == "tools/list" then
+            if p.cursor == nil then
+                reply(msg.id, {tools = [ECHO], nextCursor = "page2"})
+            else
+                reply(msg.id, {tools = [ADD]})
+            end
+        elseif msg.method == "tools/call" then
+            local args = p.arguments or {}
+            if p.name == "echo" then
+                reply(msg.id, {content = [{type = "text", text = "echo: " .. tostring(args.text)}]})
+            elseif p.name == "add" then
+                reply(msg.id, {content = [{type = "text", text = tostring(args.a + args.b)}], structuredContent = {sum = args.a + args.b}})
+            else
+                reply(msg.id, {content = [{type = "text", text = "no such tool"}], isError = true})
+            end
+        elseif msg.method == "prompts/list" then
+            reply(msg.id, {prompts = [{name = "greet", description = "A greeting"}]})
+        elseif msg.method == "prompts/get" then
+            reply(msg.id, {messages = [{role = "user", content = {type = "text", text = "Hello " .. tostring((p.arguments or {}).name)}}]})
+        elseif msg.method == "resources/list" then
+            reply(msg.id, {resources = [{uri = "mem://note", name = "note"}]})
+        elseif msg.method == "resources/read" then
+            reply(msg.id, {contents = [{uri = p.uri, text = "a note"}]})
+        elseif msg.id ~= nil then
+            fail(msg.id, -32601, "unknown method " .. msg.method)
+        end
+    end
+end
