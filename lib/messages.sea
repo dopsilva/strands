@@ -1,0 +1,196 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- messages — the conversation format
+--
+-- As in Strands (and the Bedrock Converse API), a message is
+--   {role = "user" | "assistant", content = [block, ...]}
+-- and a content block holds exactly one of:
+--   {text = "..."}
+--   {toolUse = {toolUseId, name, input}}                  (assistant)
+--   {toolResult = {toolUseId, status, content = [...]}}   (user; status
+--       "success" | "error", content blocks {text} | {json})
+--   {reasoningContent = {reasoningText = {text, signature}}}
+--   {image = {format = "png", source = {bytes = "..."}}}
+--   {document = {format, name, source = {bytes}}}
+-- Every model provider converts from and to this shape.
+
+local util = require("./util")
+
+local M = {}
+
+-- ---- Blocks ----
+
+function M.text_block(s)
+    local b = {}
+    b.text = tostring(s)
+    return b
+end
+
+function M.tool_use_block(id, name, input)
+    local u = {}
+    u.toolUseId = id
+    u.name = name
+    u.input = input or {}
+    local b = {}
+    b.toolUse = u
+    return b
+end
+
+-- a tool result; content is a string, a JSON-able value or content blocks
+function M.tool_result(id, status, content)
+    local r = {}
+    r.toolUseId = id
+    r.status = status or "success"
+    r.content = M.result_content(content)
+    return r
+end
+
+function M.tool_result_block(result)
+    local b = {}
+    b.toolResult = result
+    return b
+end
+
+-- content blocks of a tool result from what a tool returned
+function M.result_content(v)
+    if v == nil then return [M.text_block("")] end
+    if type(v) == "string" then return [M.text_block(v)] end
+    if type(v) == "array" then
+        local blocks = true
+        for _, x in v do
+            if not (util.is_record(x) and (x.text ~= nil or x.json ~= nil or x.image ~= nil or x.document ~= nil)) then
+                blocks = false
+            end
+        end
+        if blocks and len(v) > 0 then return v end
+    end
+    local b = {}
+    b.json = v
+    return [b]
+end
+
+-- ---- Messages ----
+
+function M.message(role, content)
+    local m = {}
+    m.role = role
+    if type(content) == "string" then
+        m.content = [M.text_block(content)]
+    else
+        m.content = content or []
+    end
+    return m
+end
+
+function M.user(content) return M.message("user", content) end
+function M.assistant(content) return M.message("assistant", content) end
+
+-- the text of a message (its text blocks, joined)
+function M.text(msg)
+    if msg == nil then return "" end
+    local parts = []
+    for _, b in msg.content or [] do
+        if b.text ~= nil then parts[] = b.text end
+    end
+    return string.join(parts, "")
+end
+
+-- the reasoning text of a message, if the model sent any
+function M.reasoning(msg)
+    if msg == nil then return "" end
+    local parts = []
+    for _, b in msg.content or [] do
+        if b.reasoningContent ~= nil and b.reasoningContent.reasoningText ~= nil then
+            parts[] = b.reasoningContent.reasoningText.text or ""
+        end
+    end
+    return string.join(parts, "")
+end
+
+-- the toolUse entries of a message
+function M.tool_uses(msg)
+    local out = []
+    for _, b in msg.content or [] do
+        if b.toolUse ~= nil then out[] = b.toolUse end
+    end
+    return out
+end
+
+-- the toolResult entries of a message
+function M.tool_results(msg)
+    local out = []
+    for _, b in msg.content or [] do
+        if b.toolResult ~= nil then out[] = b.toolResult end
+    end
+    return out
+end
+
+-- the text of a tool result's content (json blocks encoded)
+function M.result_text(result)
+    local parts = []
+    for _, c in result.content or [] do
+        if c.text ~= nil then
+            parts[] = c.text
+        elseif c.json ~= nil then
+            parts[] = json.encode(c.json)
+        end
+    end
+    return string.join(parts, "\n")
+end
+
+-- What an invocation's prompt adds to the conversation:
+--   nil                       nothing (continue from the current messages)
+--   "text"                    one user message
+--   [block, ...]              one user message with those content blocks
+--   [message, ...]            those messages (each with a role)
+function M.from_prompt(prompt)
+    if prompt == nil then return [] end
+    if type(prompt) == "string" then return [M.user(prompt)] end
+    if type(prompt) == "array" then
+        if len(prompt) == 0 then return [] end
+        if util.is_record(prompt[0]) and prompt[0].role ~= nil then return util.copy(prompt) end
+        return [M.user(util.copy(prompt))]
+    end
+    if util.is_record(prompt) and prompt.role ~= nil then return [util.copy(prompt)] end
+    return error("strands: a prompt is a string, content blocks or messages")
+end
+
+-- Repair a conversation so every toolUse has its toolResult: a run cut
+-- short (cancelled, a failed tool call, an interrupt) can leave an assistant
+-- toolUse without answer, which every provider rejects. Missing results
+-- become error results in the following user message (added if needed).
+function M.repair(messages)
+    local i = 0
+    while i < len(messages) do
+        local m = messages[i]
+        if m.role == "assistant" then
+            local uses = M.tool_uses(m)
+            if len(uses) > 0 then
+                local nxt = messages[i + 1]
+                if nxt == nil or nxt.role ~= "user" then
+                    nxt = M.user([])
+                    -- insert in place: callers hold this array (agent.messages)
+                    messages[] = nxt
+                    local j = len(messages) - 1
+                    while j > i + 1 do
+                        messages[j] = messages[j - 1]
+                        j -= 1
+                    end
+                    messages[i + 1] = nxt
+                end
+                local have = [=]
+                for _, r in M.tool_results(nxt) do have[r.toolUseId] = true end
+                for _, u in uses do
+                    if not have[u.toolUseId] then
+                        nxt.content[] = M.tool_result_block(M.tool_result(u.toolUseId, "error", "Tool was not executed."))
+                    end
+                end
+            end
+        end
+        i += 1
+    end
+    return messages
+end
+
+return M

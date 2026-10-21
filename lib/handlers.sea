@@ -1,0 +1,52 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- handlers — callback handlers: functions called with every progress event
+-- of an invocation (see stream.sea for the stream fields), plus
+--   {init_event_loop = true}            the invocation starts
+--   {start_event_loop = true}           a cycle starts
+--   {message = msg}                     a message was added
+--   {tool_result = result, tool_use}    a tool finished
+--   {force_stop = true, force_stop_reason}
+--   {result = result}                   the invocation ended
+
+local M = {}
+
+-- strands.handlers.printing({verbose_tool_use = true}) → handler
+-- Prints the text as it streams and a line per tool call (the default).
+function M.printing(opts)
+    local verbose = not opts or opts.verbose_tool_use ~= false
+    local count = 0
+    local current = nil
+    return function(e)
+        if e.data ~= nil then
+            io.write(e.data)
+        elseif e.reasoningText ~= nil and opts and opts.show_reasoning then
+            io.write(e.reasoningText)
+        elseif e.current_tool_use ~= nil and verbose then
+            local id = e.current_tool_use.toolUseId
+            if id ~= nil and id ~= current then
+                current = id
+                count += 1
+                io.write(`\nTool #${count}: ${e.current_tool_use.name}\n`)
+            end
+        elseif e.result ~= nil then
+            io.write("\n")
+        end
+    end
+end
+
+-- does nothing
+function M.null()
+    return function(_) end
+end
+
+-- calls several handlers
+function M.composite(...)
+    local hs = [...]
+    return function(e)
+        for _, h in hs do h(e) end
+    end
+end
+
+return M

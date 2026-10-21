@@ -1,0 +1,102 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- hooks — callbacks at each step of the agent loop
+--
+--   agent:add_hook("BeforeToolCallEvent", function(e)
+--       if e.tool_use.name == "shell" then e.cancel_tool = "shell is disabled" end
+--   end)
+--
+-- or a provider, an object with register_hooks(registry), passed in
+-- strands.agent({hooks = [provider]}). Events and their fields (writable
+-- ones marked *):
+--   AgentInitializedEvent    agent
+--   BeforeInvocationEvent    agent, messages (the new ones), invocation_state
+--   AfterInvocationEvent     agent, result
+--   MessageAddedEvent        agent, message
+--   BeforeModelCallEvent     agent, invocation_state
+--   AfterModelCallEvent      agent, stop_response {message, stop_reason},
+--                            exception, attempt, retry*
+--   BeforeToolCallEvent      agent, tool_use* (name, input), selected_tool*,
+--                            invocation_state, cancel_tool* (true or a
+--                            message), e:interrupt(name, reason)
+--   AfterToolCallEvent       agent, tool_use, selected_tool, result*,
+--                            exception, retry*
+--   BeforeNodeCallEvent      source (the swarm or graph), node_id, invocation_state, cancel*
+--   AfterNodeCallEvent       source, node_id, result
+--   BeforeMultiAgentInvocationEvent / AfterMultiAgentInvocationEvent   source, (result)
+-- "After" events run their callbacks in reverse registration order, so a
+-- provider's after-callback wraps around everything registered after it.
+
+local util = require("./util")
+
+local M = {}
+
+M.EVENTS = [
+    "AgentInitializedEvent", "BeforeInvocationEvent", "AfterInvocationEvent", "MessageAddedEvent",
+    "BeforeModelCallEvent", "AfterModelCallEvent", "BeforeToolCallEvent", "AfterToolCallEvent",
+    "BeforeNodeCallEvent", "AfterNodeCallEvent",
+    "BeforeMultiAgentInvocationEvent", "AfterMultiAgentInvocationEvent",
+]
+
+local KNOWN = [=]
+for _, n in M.EVENTS do KNOWN[n] = true end
+
+local Registry = {}
+
+function M.registry()
+    local r = {}
+    r.callbacks = [=]
+    return util.with_methods(r, Registry)
+end
+
+-- registry:add_callback(event_name, fn)
+function Registry.add_callback(self, name, fn)
+    if not KNOWN[name] then return error(`strands: unknown hook event '${tostring(name)}'`) end
+    if type(fn) ~= "function" then return error("strands: a hook callback must be a function") end
+    local cbs = self.callbacks[name]
+    if cbs == nil then
+        cbs = []
+        self.callbacks[name] = cbs
+    end
+    cbs[] = fn
+    return true
+end
+
+-- registry:add_hook(provider) — provider:register_hooks(registry)
+function Registry.add_hook(self, provider)
+    if type(provider) == "function" then return error("strands: add_hook(provider) takes an object; use add_callback(event, fn)") end
+    if not util.is_record(provider) or type(provider.register_hooks) ~= "function" then
+        return error("strands: a hook provider needs register_hooks(registry)")
+    end
+    local r = provider:register_hooks(self)
+    if is_error(r) then return r end
+    return true
+end
+
+function Registry.has(self, name)
+    local cbs = self.callbacks[name]
+    return cbs ~= nil and len(cbs) > 0
+end
+
+-- registry:invoke(event_name, event) → event (callbacks may have changed it)
+function Registry.invoke(self, name, event)
+    local cbs = self.callbacks[name]
+    if cbs == nil then return event end
+    event.event_name = name
+    if string.starts_with(name, "After") then
+        for i = len(cbs) - 1, 0, -1 do cbs[i](event) end
+    else
+        for _, f in cbs do f(event) end
+    end
+    return event
+end
+
+-- an event table (fields added later by callbacks are allowed)
+function M.event(fields)
+    local e = {}
+    for k, v in fields do e[k] = v end
+    return e
+end
+
+return M

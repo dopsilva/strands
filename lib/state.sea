@@ -1,0 +1,50 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- state — agent.state, key/value data kept with the agent (and its session)
+-- but never sent to the model. Values must be JSON-serializable.
+--
+--   agent.state:set("user", {name = "Ana"})
+--   agent.state:get("user").name
+--   agent.state:get()          -- everything, as a table
+--   agent.state:delete("user")
+
+local util = require("./util")
+
+local M = {}
+
+local State = {}
+
+function M.new(initial)
+    local s = {}
+    s.data = {}
+    util.with_methods(s, State)
+    for k, v in initial or {} do
+        local ok = s:set(k, v)
+        if is_error(ok) then return ok end
+    end
+    return s
+end
+
+function State.set(self, key, value)
+    if type(key) ~= "string" then return error("strands: state keys are strings") end
+    local enc = json.encode(value)
+    if is_error(enc) then return error(`strands: state value for '${key}' is not JSON-serializable: ${enc.message}`) end
+    self.data[key] = util.copy(value)
+    return true
+end
+
+function State.get(self, key)
+    if key == nil then return util.copy(self.data) end
+    return util.copy(self.data[key])
+end
+
+function State.delete(self, key)
+    del self.data[key]
+end
+
+function State.keys(self)
+    return list.keys(self.data)
+end
+
+return M

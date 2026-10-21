@@ -1,0 +1,174 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- stream — turns a model's stream events into a message
+--
+-- A model provider implements
+--   model:stream(request, emit) → true | error
+-- where request = {messages, tool_specs, system_prompt, tool_choice} and
+-- emit(event) is called with Strands (Bedrock Converse) stream events:
+--   {messageStart = {role = "assistant"}}
+--   {contentBlockStart = {start = {toolUse = {toolUseId, name}}}}   (or start = {})
+--   {contentBlockDelta = {delta = {text = "..."}}}
+--   {contentBlockDelta = {delta = {toolUse = {input = "<partial JSON>"}}}}
+--   {contentBlockDelta = {delta = {reasoningContent = {text, signature}}}}
+--   {contentBlockStop = {}}
+--   {messageStop = {stopReason = "end_turn" | "tool_use" | "max_tokens" | ...}}
+--   {metadata = {usage = {inputTokens, outputTokens, totalTokens}, metrics = {latencyMs}}}
+-- The collector builds the assistant message from them and reports the
+-- progress to a callback, as Strands' callback handlers receive it:
+--   {data = "text delta", delta = {...}}
+--   {reasoningText = "...", reasoning = true}
+--   {current_tool_use = {toolUseId, name, input}}   (input: the JSON so far)
+--   {event = <the raw stream event>}
+
+local util = require("./util")
+local messages = require("./messages")
+
+local M = {}
+
+local Collector = {}
+
+-- stream.collector(callback) → collector; collector.emit is the function
+-- to pass to model:stream
+function M.collector(callback)
+    local c = {}
+    c.callback = callback or (function(_) end)
+    c.message = messages.assistant([])
+    c.stop_reason = nil
+    c.usage = {}
+    c.usage.inputTokens = 0
+    c.usage.outputTokens = 0
+    c.usage.totalTokens = 0
+    c.metrics = {}
+    c.block = nil -- the open block: {kind = "text"|"tool"|"reasoning", ...}
+    c.started = util.now_ms()
+    util.with_methods(c, Collector)
+    c.emit = function(ev) c:on_event(ev) end
+    return c
+end
+
+local function report(self, fields)
+    local e = {}
+    for k, v in fields do e[k] = v end
+    self.callback(e)
+end
+
+function Collector.close_block(self)
+    local b = self.block
+    if b == nil then return end
+    self.block = nil
+    if b.kind == "tool" then
+        local input = {}
+        local text = string.trim(b.input)
+        if text ~= "" then
+            local v = json.decode(text)
+            if is_error(v) then
+                -- the model sent broken JSON: hand it over as is, the tool
+                -- validation then reports the problem back to the model
+                input = {}
+                input.__raw = b.input
+            else
+                input = v
+            end
+        end
+        self.message.content[] = messages.tool_use_block(b.id, b.name, input)
+    elseif b.kind == "reasoning" then
+        if b.text ~= "" or b.signature ~= nil then
+            local rt = {}
+            rt.text = b.text
+            if b.signature ~= nil then rt.signature = b.signature end
+            local rc = {}
+            rc.reasoningText = rt
+            local blk = {}
+            blk.reasoningContent = rc
+            self.message.content[] = blk
+        end
+    elseif b.text ~= "" then
+        self.message.content[] = messages.text_block(b.text)
+    end
+end
+
+local function open(self, kind)
+    if self.block ~= nil and self.block.kind == kind then return self.block end
+    self:close_block()
+    local b = {}
+    b.kind = kind
+    b.text = ""
+    b.input = ""
+    self.block = b
+    return b
+end
+
+function Collector.on_event(self, ev)
+    report(self, {event = ev})
+    if ev.messageStart ~= nil then
+        self.message.role = ev.messageStart.role or "assistant"
+    elseif ev.contentBlockStart ~= nil then
+        self:close_block()
+        local start = ev.contentBlockStart.start or {}
+        if start.toolUse ~= nil then
+            local b = open(self, "tool")
+            b.id = start.toolUse.toolUseId
+            b.name = start.toolUse.name
+        end
+    elseif ev.contentBlockDelta ~= nil then
+        local d = ev.contentBlockDelta.delta or {}
+        if d.text ~= nil then
+            local b = open(self, "text")
+            b.text ..= d.text
+            report(self, {data = d.text, delta = d})
+        elseif d.toolUse ~= nil then
+            local b = self.block
+            if b == nil or b.kind ~= "tool" then
+                b = open(self, "tool")
+            end
+            b.input ..= d.toolUse.input or ""
+            local cur = {}
+            cur.toolUseId = b.id
+            cur.name = b.name
+            cur.input = b.input
+            report(self, {current_tool_use = cur, delta = d})
+        elseif d.reasoningContent ~= nil then
+            local b = open(self, "reasoning")
+            if d.reasoningContent.text ~= nil then
+                b.text ..= d.reasoningContent.text
+                report(self, {reasoningText = d.reasoningContent.text, reasoning = true, delta = d})
+            end
+            if d.reasoningContent.signature ~= nil then b.signature = d.reasoningContent.signature end
+        end
+    elseif ev.contentBlockStop ~= nil then
+        self:close_block()
+    elseif ev.messageStop ~= nil then
+        self:close_block()
+        self.stop_reason = ev.messageStop.stopReason
+    elseif ev.metadata ~= nil then
+        local u = ev.metadata.usage
+        if u ~= nil then
+            self.usage.inputTokens += u.inputTokens or 0
+            self.usage.outputTokens += u.outputTokens or 0
+            self.usage.totalTokens += u.totalTokens or ((u.inputTokens or 0) + (u.outputTokens or 0))
+        end
+        if ev.metadata.metrics ~= nil then
+            for k, v in ev.metadata.metrics do self.metrics[k] = v end
+        end
+    end
+end
+
+-- collector:finish() → {message, stop_reason, usage, metrics}
+function Collector.finish(self)
+    self:close_block()
+    local stop = self.stop_reason
+    if stop == nil then
+        stop = len(messages.tool_uses(self.message)) > 0 and "tool_use" or "end_turn"
+    end
+    if self.metrics.latencyMs == nil then self.metrics.latencyMs = util.now_ms() - self.started end
+    local r = {}
+    r.message = self.message
+    r.stop_reason = stop
+    r.usage = self.usage
+    r.metrics = self.metrics
+    return r
+end
+
+return M

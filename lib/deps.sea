@@ -1,0 +1,12 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- deps — the Sea libraries strands uses, found in one place: the http
+-- client from the sea_vm checkout next to this project (~/projects/sea_vm).
+-- Change the path here if the libraries live elsewhere.
+
+local M = {}
+
+M.http = require("../../sea_vm/libs/http/http")
+
+return M

@@ -1,0 +1,280 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- tools — tools the model can call
+--
+--   local weather = strands.tool({
+--       name = "weather",
+--       description = "Current weather of a city",
+--       inputs = {
+--           city = {type = "string", description = "City name"},
+--           unit = {type = "string", enum = ["c", "f"], default = "c"},
+--       },
+--       fn = function(input, ctx) return `Sunny in ${input.city}` end,
+--   })
+--
+-- inputs describe the parameters (a JSON Schema object is built from them);
+-- or pass input_schema, a full JSON Schema. A parameter is required unless
+-- it has a default or optional = true. fn(input, ctx) gets the validated
+-- input (defaults filled in) and a context:
+--   ctx.tool_use          {toolUseId, name, input}
+--   ctx.agent             the agent running the tool
+--   ctx.invocation_state  the table passed to agent:invoke(prompt, {state = ...})
+-- and returns a string, any JSON value, a full tool result
+-- ({status, content}), or an error value (the model then sees the error).
+
+local util = require("./util")
+local messages = require("./messages")
+
+local M = {}
+
+local Tool = {}
+
+local TYPES = {string = true, integer = true, number = true, boolean = true, array = true, object = true, null = true}
+
+-- JSON Schema of one parameter from its description
+local function param_schema(name, p)
+    if type(p) == "string" then
+        local s = {}
+        s.type = p
+        return s
+    end
+    if not util.is_record(p) then return error(`strands: parameter '${name}' must be a type name or a table`) end
+    local s = {}
+    for _, k in ["type", "description", "enum", "default", "minimum", "maximum", "minLength", "maxLength", "pattern", "format"] do
+        if p[k] ~= nil then s[k] = p[k] end
+    end
+    if s.type == nil and p.enum == nil then s.type = "string" end
+    if p.items ~= nil then s.items = param_schema(`${name}[]`, p.items)? end
+    if p.properties ~= nil then
+        local obj = M.object_schema(p.properties)?
+        s.properties = obj.properties
+        if obj.required ~= nil then s.required = obj.required end
+        s.type = "object"
+    end
+    if s.type ~= nil and not TYPES[s.type] then
+        return error(`strands: parameter '${name}' has unknown type '${s.type}'`)
+    end
+    return s
+end
+
+-- {type = "object", properties, required} from a table of parameter specs
+function M.object_schema(inputs)
+    local props = {}
+    local required = []
+    for _, name in list.keys(inputs or {}) do
+        local p = inputs[name]
+        props[name] = param_schema(name, p)?
+        local optional = util.is_record(p) and (p.optional == true or p.default ~= nil or p.required == false)
+        if not optional then required[] = name end
+    end
+    local s = {}
+    s.type = "object"
+    s.properties = props
+    if len(required) > 0 then s.required = required end
+    return s
+end
+
+-- strands.tool(spec) → tool | error
+function M.tool(spec)
+    if not util.is_record(spec) then return error("strands: tool() expects a table") end
+    local name = spec.name
+    if type(name) ~= "string" or re.match("^[A-Za-z0-9_-]{1,64}$", name) == nil then
+        return error(`strands: tool name must match [A-Za-z0-9_-]{1,64}, got '${tostring(name)}'`)
+    end
+    if type(spec.fn) ~= "function" then return error(`strands: tool '${name}' needs fn(input, ctx)`) end
+    local t = {}
+    t.name = name
+    t.description = spec.description or name
+    if spec.input_schema ~= nil then
+        t.input_schema = util.copy(spec.input_schema)
+    else
+        t.input_schema = M.object_schema(spec.inputs)?
+    end
+    t.fn = spec.fn
+    t.__is_tool = true
+    return util.with_methods(t, Tool)
+end
+
+-- tool:spec() → {name, description, inputSchema = {json}} (the Strands ToolSpec)
+function Tool.spec(self)
+    local s = {}
+    s.name = self.name
+    s.description = self.description
+    local is = {}
+    is.json = self.input_schema
+    s.inputSchema = is
+    return s
+end
+
+-- ---- Validation ----
+
+local function type_ok(want, v)
+    local t = type(v)
+    if want == "string" then return t == "string" end
+    if want == "integer" then return t == "int" or (t == "number" and v == math.floor(v)) end
+    if want == "number" then return t == "int" or t == "number" end
+    if want == "boolean" then return t == "bool" end
+    if want == "array" then return t == "array" end
+    if want == "object" then return util.is_record(v) end
+    if want == "null" then return v == nil end
+    return true
+end
+
+-- check v against a (simple) JSON Schema; fills defaults into objects.
+-- Returns the value (maybe with defaults) or an error naming the path.
+function M.validate(schema, v, path)
+    path = path or "input"
+    if schema == nil then return v end
+    if v == nil and schema.default ~= nil then v = util.copy(schema.default) end
+    local want = schema.type
+    if type(want) == "array" then
+        local any = false
+        for _, w in want do
+            if type_ok(w, v) then any = true end
+        end
+        if not any then return error(`${path} must be ${string.join(want, " or ")}`) end
+    elseif want ~= nil and not type_ok(want, v) then
+        return error(`${path} must be ${want == "object" and "an object" or (want == "array" and "an array" or "a " .. want)}, got ${type(v)}`)
+    end
+    if schema.enum ~= nil and not list.contains(schema.enum, v) then
+        return error(`${path} must be one of ${json.encode(schema.enum)}`)
+    end
+    if type(v) == "string" then
+        if schema.minLength ~= nil and utf8.len(v) < schema.minLength then return error(`${path} is shorter than ${schema.minLength}`) end
+        if schema.maxLength ~= nil and utf8.len(v) > schema.maxLength then return error(`${path} is longer than ${schema.maxLength}`) end
+        if schema.pattern ~= nil and re.match(schema.pattern, v) == nil then return error(`${path} does not match ${schema.pattern}`) end
+    end
+    if type(v) == "int" or type(v) == "number" then
+        if schema.minimum ~= nil and v < schema.minimum then return error(`${path} must be >= ${schema.minimum}`) end
+        if schema.maximum ~= nil and v > schema.maximum then return error(`${path} must be <= ${schema.maximum}`) end
+    end
+    if type(v) == "array" and schema.items ~= nil then
+        local out = []
+        for i, x in v do out[] = M.validate(schema.items, x, `${path}[${i}]`)? end
+        v = out
+    end
+    if util.is_record(v) and (schema.properties ~= nil or schema.required ~= nil) then
+        local out = {}
+        for k, x in v do out[k] = x end
+        for _, k in schema.required or [] do
+            if out[k] == nil and (schema.properties == nil or schema.properties[k] == nil or schema.properties[k].default == nil) then
+                return error(`${path}.${k} is required`)
+            end
+        end
+        for k, ps in schema.properties or {} do
+            if out[k] ~= nil or ps.default ~= nil then
+                out[k] = M.validate(ps, out[k], `${path}.${k}`)?
+            end
+        end
+        if schema.additionalProperties == false then
+            for k, _ in out do
+                if schema.properties == nil or schema.properties[k] == nil then
+                    return error(`${path}.${k} is not allowed`)
+                end
+            end
+        end
+        v = out
+    end
+    return v
+end
+
+-- ---- Running ----
+
+-- a tool's return value as a tool result
+function M.to_result(tool_use_id, v)
+    if is_error(v) then
+        return messages.tool_result(tool_use_id, "error", `Error: ${util.message_of(v)}`)
+    end
+    if util.is_record(v) and v.status ~= nil and v.content ~= nil then
+        local r = messages.tool_result(tool_use_id, v.status, v.content)
+        return r
+    end
+    return messages.tool_result(tool_use_id, "success", v)
+end
+
+-- run a tool for a toolUse: validation, the call (a panic becomes an error
+-- result), the result. Returns a tool result, never an error.
+function M.run(tool, tool_use, ctx)
+    local input = M.validate(tool.input_schema, tool_use.input or {}, "input")
+    if is_error(input) then
+        return messages.tool_result(tool_use.toolUseId, "error", `Invalid input for tool '${tool.name}': ${input.message}`)
+    end
+    local failed = nil
+    local out = nil
+    local function call()
+        defer function()
+            local e = recover()
+            if e ~= nil then failed = e end
+        end
+        out = tool.fn(input, ctx)
+    end
+    call()
+    if failed ~= nil then
+        local m = is_error(failed) and failed.message or tostring(failed)
+        return messages.tool_result(tool_use.toolUseId, "error", `Error: tool '${tool.name}' failed: ${m}`)
+    end
+    return M.to_result(tool_use.toolUseId, out)
+end
+
+-- ---- Registry ----
+
+local Registry = {}
+
+-- tools.registry([tool, ...]) → registry | error
+function M.registry(list_of_tools)
+    local r = {}
+    r.by_name = [=]
+    r.order = []
+    util.with_methods(r, Registry)
+    for _, t in list_of_tools or [] do
+        r:add(t)?
+    end
+    return r
+end
+
+-- registry:add(tool) — a tool object, or a table with tools (a module)
+function Registry.add(self, t)
+    if util.is_record(t) and t.__is_tool then
+        if self.by_name[t.name] ~= nil then return error(`strands: duplicate tool name '${t.name}'`) end
+        self.by_name[t.name] = t
+        self.order[] = t.name
+        return true
+    end
+    if util.is_record(t) and t.tools ~= nil then
+        -- an MCP client or a provider with a list of tools
+        local ts = t.tools
+        if type(ts) == "function" then ts = t:tools()? end
+        for _, x in ts do self:add(x)? end
+        return true
+    end
+    return error(`strands: not a tool: ${type(t)}`)
+end
+
+function Registry.remove(self, name)
+    if self.by_name[name] == nil then return false end
+    del self.by_name[name]
+    local keep = []
+    for _, n in self.order do
+        if n ~= name then keep[] = n end
+    end
+    self.order = keep
+    return true
+end
+
+function Registry.get(self, name)
+    return self.by_name[name]
+end
+
+function Registry.names(self)
+    return list.copy(self.order)
+end
+
+-- the ToolSpecs sent to the model
+function Registry.specs(self)
+    local out = []
+    for _, n in self.order do out[] = self.by_name[n]:spec() end
+    return out
+end
+
+return M

@@ -1,0 +1,713 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- agent — the agent and its event loop
+--
+--   local agent = strands.agent({
+--       model = strands.models.maritaca({model_id = "sabia-4"}),
+--       system_prompt = "Você é um assistente prestativo.",
+--       tools = [calculator],
+--   })
+--   local result = agent:invoke("Quanto é 1764 / 42?")?
+--   print(result.text)
+--
+-- The loop: call the model with the conversation and the tool specs; if it
+-- asks for tools, run them (concurrently by default), add their results and
+-- call the model again; stop at a final answer, a limit, a cancel or an
+-- interrupt. See README.md for every option.
+
+local util = require("./util")
+local messages = require("./messages")
+local tools_mod = require("./tools")
+local hooks_mod = require("./hooks")
+local stream_mod = require("./stream")
+local state_mod = require("./state")
+local metrics_mod = require("./metrics")
+local handlers = require("./handlers")
+local conversation = require("./conversation")
+local maritaca = require("./models/maritaca")
+
+local M = {}
+
+local Agent = {}
+
+local function default_retry()
+    local r = {}
+    r.max_attempts = 6
+    r.initial_delay_ms = 4000
+    r.max_delay_ms = 240000
+    return r
+end
+
+-- strands.agent(opts) → agent | error
+--   model                 a model provider (default: Maritaca sabia-4)
+--   system_prompt         instructions for the model
+--   tools                 tools, MCP clients or other agents' as_tool()
+--   messages              an initial conversation
+--   name, description, agent_id
+--   callback_handler      function(event); default: print as it streams;
+--                         false: silent
+--   conversation_manager  default: sliding_window({window_size = 40})
+--   hooks                 hook providers (objects with register_hooks)
+--   session_manager       restores and saves the agent (see session.sea)
+--   state                 initial agent.state values
+--   tool_executor         "concurrent" (default) or "sequential"
+--   max_turns             model calls per invocation (default unlimited)
+--   max_total_tokens      tokens per invocation (default unlimited)
+--   retry                 {max_attempts = 6, initial_delay_ms = 4000,
+--                         max_delay_ms = 240000} for throttled calls
+--   record_direct_tool_call  true: agent.tool.x() calls go into the history
+function M.agent(opts)
+    opts = opts or {}
+    local a = {}
+    a.__is_agent = true
+    a.name = opts.name or "Strands Agents"
+    a.description = opts.description or ""
+    a.agent_id = opts.agent_id or "default"
+    a.model = opts.model or maritaca.model()
+    a.system_prompt = opts.system_prompt
+    a.messages = util.copy(opts.messages or [])
+    a.state = state_mod.new(opts.state)?
+    a.tool_registry = tools_mod.registry(opts.tools)?
+    a.tool = {}
+    if opts.callback_handler == false then
+        a.callback_handler = handlers.null()
+    else
+        a.callback_handler = opts.callback_handler or handlers.printing()
+    end
+    a.conversation_manager = opts.conversation_manager or conversation.sliding_window()
+    a.hooks = hooks_mod.registry()
+    a.session_manager = opts.session_manager
+    a.tool_executor = opts.tool_executor or "concurrent"
+    a.max_turns = opts.max_turns
+    a.max_total_tokens = opts.max_total_tokens
+    a.retry = util.merge(default_retry(), opts.retry)
+    a.record_direct_tool_call = opts.record_direct_tool_call ~= false
+    a.trace_attributes = opts.trace_attributes or {}
+    a.running = false
+    a.cancelled = false
+    a.pending = nil -- an interrupted tool round: {message, results, interrupts}
+    a.interrupt_responses = {}
+    a.last_result = nil
+    a.opts = opts
+    util.with_methods(a, Agent)
+    a:refresh_tool_proxy()
+    for _, h in opts.hooks or [] do
+        a.hooks:add_hook(h)?
+    end
+    if a.session_manager ~= nil then
+        a.hooks:add_hook(a.session_manager)?
+        if type(a.session_manager.initialize) == "function" then
+            a.session_manager:initialize(a)?
+        end
+    end
+    a.hooks:invoke("AgentInitializedEvent", hooks_mod.event({agent = a}))
+    return a
+end
+
+-- ---- Tools ----
+
+-- agent.tool.<name>(input [, opts]) calls a tool directly
+function Agent.refresh_tool_proxy(self)
+    local proxy = {}
+    for _, name in self.tool_registry:names() do
+        proxy[name] = function(input, opts) return self:call_tool(name, input, opts) end
+    end
+    self.tool = proxy
+end
+
+function Agent.add_tool(self, t)
+    self.tool_registry:add(t)?
+    self:refresh_tool_proxy()
+    return true
+end
+
+function Agent.remove_tool(self, name)
+    local ok = self.tool_registry:remove(name)
+    self:refresh_tool_proxy()
+    return ok
+end
+
+function Agent.tool_names(self)
+    return self.tool_registry:names()
+end
+
+-- ---- Hooks ----
+
+function Agent.add_hook(self, event_name, fn)
+    if type(event_name) ~= "string" then return self.hooks:add_hook(event_name) end
+    return self.hooks:add_callback(event_name, fn)
+end
+
+-- ---- Messages ----
+
+local function emit(ctx, fields)
+    local e = {}
+    for k, v in fields do e[k] = v end
+    for _, h in ctx.callbacks do h(e) end
+end
+
+function Agent.add_message(self, msg, ctx)
+    self.messages[] = msg
+    self.hooks:invoke("MessageAddedEvent", hooks_mod.event({agent = self, message = msg}))
+    if ctx ~= nil then emit(ctx, {message = msg}) end
+end
+
+-- ---- Model calls ----
+
+local function call_model(self, ctx)
+    local attempt = 0
+    local delay = self.retry.initial_delay_ms
+    while true do
+        attempt += 1
+        if self.cancelled then return util.err("cancelled", "the agent was cancelled") end
+        self.hooks:invoke("BeforeModelCallEvent", hooks_mod.event({agent = self, invocation_state = ctx.invocation_state}))
+        local specs = self.tool_registry:specs()
+        for _, t in ctx.extra_tools do specs[] = t:spec() end
+        local req = {}
+        req.messages = self.messages
+        req.tool_specs = specs
+        req.system_prompt = self.system_prompt
+        req.tool_choice = ctx.tool_choice
+        req.cancelled = function() return self.cancelled end
+        local span = metrics_mod.span("model_call", {model = self.model.model_id, attempt = attempt})
+        local collector = stream_mod.collector(function(e) emit(ctx, e) end)
+        local r = self.model:stream(req, collector.emit)
+        if is_error(r) then
+            metrics_mod.end_span(span, {error = r.message})
+            ctx.cycle_span.children[] = span
+            if self.cancelled then return util.err("cancelled", "the agent was cancelled") end
+            local ev = self.hooks:invoke("AfterModelCallEvent", hooks_mod.event({agent = self, exception = r, attempt = attempt, retry = false}))
+            local kind = util.kind_of(r)
+            if ev.retry then
+                -- a hook asked for another try
+            elseif kind == "context_window_overflow" then
+                local red = self.conversation_manager:reduce_context(self, r)
+                if is_error(red) then return red end
+            elseif kind == "throttled" and attempt < self.retry.max_attempts then
+                emit(ctx, {event_loop_throttled_delay = delay})
+                time.sleep(delay * time.Millisecond)
+                delay *= 2
+                if delay > self.retry.max_delay_ms then delay = self.retry.max_delay_ms end
+            else
+                return r
+            end
+        else
+            local res = collector:finish()
+            metrics_mod.end_span(span, {stop_reason = res.stop_reason, usage = res.usage})
+            ctx.cycle_span.children[] = span
+            local sr = {}
+            sr.message = res.message
+            sr.stop_reason = res.stop_reason
+            local ev = self.hooks:invoke("AfterModelCallEvent", hooks_mod.event({agent = self, stop_response = sr, attempt = attempt, retry = false}))
+            ctx.metrics:add_usage(res.usage, res.metrics)
+            if not ev.retry then return res end
+        end
+    end
+end
+
+-- ---- Tool calls ----
+
+local function interrupt_id(tool_use, name)
+    return `${tool_use.toolUseId}:${name}`
+end
+
+-- run one tool call through the hooks; returns a tool result, or nil when a
+-- hook interrupted it (the interrupt is added to ctx.interrupts)
+local function run_tool(self, use, ctx)
+    local t0 = util.now_ms()
+    local tool = self.tool_registry:get(use.name)
+    if tool == nil then
+        for _, t in ctx.extra_tools do
+            if t.name == use.name then tool = t end
+        end
+    end
+    local bev = hooks_mod.event({
+        agent = self, selected_tool = tool, tool_use = util.copy(use),
+        invocation_state = ctx.invocation_state, cancel_tool = false,
+    })
+    bev.interrupted = nil
+    -- e:interrupt(name, reason): stop for a human answer; on resume the
+    -- same call returns that answer
+    bev.interrupt = function(e, name, reason)
+        local id = interrupt_id(use, name)
+        local resp = self.interrupt_responses[id]
+        if resp ~= nil then return resp end
+        local it = {}
+        it.id = id
+        it.name = name
+        it.reason = reason
+        it.tool_use = util.copy(use)
+        e.interrupted = it
+        return nil
+    end
+    self.hooks:invoke("BeforeToolCallEvent", bev)
+    if bev.interrupted ~= nil then
+        ctx.mu:acquire()
+        ctx.interrupts[] = bev.interrupted
+        ctx.mu:release()
+        return nil
+    end
+    local result = nil
+    local span = metrics_mod.span("tool_call", {tool = use.name, toolUseId = use.toolUseId})
+    while true do
+        if bev.cancel_tool ~= false and bev.cancel_tool ~= nil then
+            local msg = type(bev.cancel_tool) == "string" and bev.cancel_tool or "Tool call cancelled by a hook"
+            result = messages.tool_result(use.toolUseId, "error", msg)
+        elseif bev.selected_tool == nil then
+            result = messages.tool_result(use.toolUseId, "error", `Error: tool '${use.name}' not found in the registry`)
+        else
+            local tctx = {}
+            tctx.tool_use = bev.tool_use
+            tctx.agent = self
+            tctx.invocation_state = ctx.invocation_state
+            result = tools_mod.run(bev.selected_tool, bev.tool_use, tctx)
+        end
+        local aev = self.hooks:invoke("AfterToolCallEvent", hooks_mod.event({
+            agent = self, selected_tool = bev.selected_tool,
+            tool_use = bev.tool_use, result = result, exception = nil, retry = false,
+        }))
+        result = aev.result
+        if not aev.retry then break end
+    end
+    result.toolUseId = use.toolUseId
+    local ms = util.now_ms() - t0
+    metrics_mod.end_span(span, {status = result.status})
+    ctx.mu:acquire()
+    ctx.cycle_span.children[] = span
+    ctx.metrics:add_tool(use.name, result.status == "success", ms)
+    ctx.mu:release()
+    emit(ctx, {tool_result = result, tool_use = use})
+    return result
+end
+
+-- run the tool calls of an assistant message; done = results already
+-- known (from before an interrupt). Returns the results in call order
+-- (nil for interrupted calls).
+local function run_tools(self, msg, ctx, done)
+    local uses = messages.tool_uses(msg)
+    local results = [] -- results[i] for uses[i]; nil when interrupted
+    local todo = []
+    for i, u in uses do
+        if done ~= nil and done[u.toolUseId] ~= nil then
+            results[i] = done[u.toolUseId]
+        else
+            todo[] = i
+        end
+    end
+    if self.tool_executor == "sequential" or len(todo) <= 1 then
+        for _, i in todo do
+            if self.cancelled then break end
+            results[i] = run_tool(self, uses[i], ctx)
+        end
+    else
+        local wg = sync.waitgroup()
+        for _, i in todo do
+            wg:add(1)
+            go (function()
+                defer wg:done()
+                local r = run_tool(self, uses[i], ctx)
+                ctx.mu:acquire()
+                results[i] = r
+                ctx.mu:release()
+            end)()
+        end
+        wg:wait()
+    end
+    return uses, results
+end
+
+-- ---- Invocation ----
+
+local function new_ctx(self, opts)
+    local ctx = {}
+    ctx.invocation_state = opts.state or {}
+    ctx.callbacks = [self.callback_handler]
+    if opts.callback_handler ~= nil then ctx.callbacks[] = opts.callback_handler end
+    ctx.metrics = metrics_mod.new()
+    ctx.extra_tools = opts.extra_tools or []
+    ctx.tool_choice = nil
+    ctx.interrupts = []
+    ctx.mu = sync.mutex()
+    ctx.stop = false -- set by a tool to end the loop after its round
+    ctx.max_turns = opts.max_turns or self.max_turns
+    ctx.max_total_tokens = opts.max_total_tokens or self.max_total_tokens
+    return ctx
+end
+
+local function make_result(self, ctx, stop_reason, message)
+    local r = {}
+    r.stop_reason = stop_reason
+    r.message = message
+    r.text = messages.text(message)
+    r.reasoning = messages.reasoning(message)
+    r.metrics = ctx.metrics:summary()
+    r.usage = util.copy(ctx.metrics.accumulated_usage)
+    r.state = ctx.invocation_state
+    r.interrupts = ctx.interrupts
+    r.structured_output = ctx.structured_output
+    return r
+end
+
+-- the tool results of a round as one user message
+local function results_message(results)
+    local blocks = []
+    for _, r in results do
+        if r ~= nil then blocks[] = messages.tool_result_block(r) end
+    end
+    return messages.user(blocks)
+end
+
+-- the event loop proper
+local function run_loop(self, ctx, resume)
+    local inv_span = metrics_mod.span("invocation", util.merge(self.trace_attributes, {agent = self.name}))
+    ctx.metrics.traces[] = inv_span
+    local stop_reason = "end_turn"
+    local final = nil
+    local failure = nil
+
+    -- finish an interrupted tool round first
+    if resume ~= nil then
+        local cspan = metrics_mod.span("cycle", {resumed = true})
+        ctx.cycle_span = cspan
+        inv_span.children[] = cspan
+        local uses, results = run_tools(self, resume.message, ctx, resume.done)
+        metrics_mod.end_span(cspan)
+        if len(ctx.interrupts) > 0 then
+            local done = resume.done
+            for i, u in uses do
+                if results[i] ~= nil then done[u.toolUseId] = results[i] end
+            end
+            local p = {}
+            p.message = resume.message
+            p.done = done
+            self.pending = p
+            stop_reason = "interrupt"
+            final = resume.message
+        else
+            self:add_message(results_message(results), ctx)
+            if ctx.stop then resume = "stop" end
+        end
+    end
+
+    while stop_reason ~= "interrupt" and resume ~= "stop" do
+        if self.cancelled then
+            stop_reason = "cancelled"
+            break
+        end
+        if ctx.max_turns ~= nil and ctx.metrics.cycle_count >= ctx.max_turns then
+            stop_reason = "limit_turns"
+            emit(ctx, {force_stop = true, force_stop_reason = "limit_turns"})
+            break
+        end
+        if ctx.max_total_tokens ~= nil and ctx.metrics.accumulated_usage.totalTokens >= ctx.max_total_tokens then
+            stop_reason = "limit_total_tokens"
+            emit(ctx, {force_stop = true, force_stop_reason = "limit_total_tokens"})
+            break
+        end
+        ctx.metrics.cycle_count += 1
+        local cspan = metrics_mod.span("cycle", {cycle = ctx.metrics.cycle_count})
+        ctx.cycle_span = cspan
+        inv_span.children[] = cspan
+        local t0 = util.now_ms()
+        emit(ctx, {start_event_loop = true})
+        if self.conversation_manager.per_turn then self.conversation_manager:apply_management(self) end
+
+        local res = call_model(self, ctx)
+        if is_error(res) then
+            metrics_mod.end_span(cspan, {error = res.message})
+            if util.kind_of(res) == "cancelled" then
+                stop_reason = "cancelled"
+                break
+            end
+            failure = res
+            break
+        end
+        self:add_message(res.message, ctx)
+        final = res.message
+        stop_reason = res.stop_reason
+
+        if stop_reason == "max_tokens" then
+            failure = util.err("max_tokens", "the model reached its output token limit; the answer is cut")
+            metrics_mod.end_span(cspan)
+            break
+        end
+        if stop_reason == "tool_use" then
+            local uses, results = run_tools(self, res.message, ctx, nil)
+            if len(ctx.interrupts) > 0 then
+                local done = {}
+                for i, u in uses do
+                    if results[i] ~= nil then done[u.toolUseId] = results[i] end
+                end
+                local p = {}
+                p.message = res.message
+                p.done = done
+                self.pending = p
+                stop_reason = "interrupt"
+                metrics_mod.end_span(cspan)
+                break
+            end
+            self:add_message(results_message(results), ctx)
+            metrics_mod.end_span(cspan)
+            ctx.metrics.cycle_durations[] = util.now_ms() - t0
+            if ctx.stop then
+                stop_reason = "end_turn"
+                break
+            end
+            if self.cancelled then
+                stop_reason = "cancelled"
+                break
+            end
+        else
+            metrics_mod.end_span(cspan)
+            ctx.metrics.cycle_durations[] = util.now_ms() - t0
+            break
+        end
+    end
+
+    if stop_reason == "cancelled" then messages.repair(self.messages) end
+    if failure == nil and stop_reason ~= "interrupt" then
+        local m = self.conversation_manager:apply_management(self)
+        if is_error(m) then failure = m end
+    end
+    metrics_mod.end_span(inv_span, {stop_reason = stop_reason})
+    if failure ~= nil then
+        if util.kind_of(failure) ~= "max_tokens" then messages.repair(self.messages) end
+        self.hooks:invoke("AfterInvocationEvent", hooks_mod.event({agent = self, result = nil, exception = failure}))
+        return failure
+    end
+    local result = make_result(self, ctx, stop_reason, final)
+    self.last_result = result
+    local aev = self.hooks:invoke("AfterInvocationEvent", hooks_mod.event({agent = self, result = result}))
+    emit(ctx, {result = result})
+    if aev.resume ~= nil then
+        -- a hook asked for another invocation with this input
+        return self:invoke_unlocked(aev.resume, {})
+    end
+    return result
+end
+
+-- agent:invoke(prompt [, opts]) → result | error
+--   prompt: a string, content blocks, messages, or (after an interrupt)
+--   the responses [{interruptResponse = {interruptId, response}}]
+--   opts.state             invocation_state for hooks and tools
+--   opts.callback_handler  an extra handler for this invocation
+--   opts.max_turns, opts.max_total_tokens   limits for this invocation
+--   opts.structured_output a JSON Schema (or tool inputs) the final answer
+--                          must follow; then result.structured_output
+-- The result: stop_reason, message, text, reasoning, usage, metrics,
+-- state, interrupts (after stop_reason "interrupt"), structured_output.
+function Agent.invoke(self, prompt, opts)
+    if self.running then
+        return error("strands: the agent is already running an invocation (agents are not reentrant)")
+    end
+    self.running = true
+    self.cancelled = false
+    local function run()
+        defer function() self.running = false end
+        return self:invoke_unlocked(prompt, opts or {})
+    end
+    return run()
+end
+
+function Agent.invoke_unlocked(self, prompt, opts)
+    if opts.structured_output ~= nil then return self:structured_unlocked(opts.structured_output, prompt, opts) end
+    local ctx = new_ctx(self, opts)
+    local resume = nil
+    if self.pending ~= nil then
+        local responses = M.interrupt_responses(prompt)
+        if responses == nil then
+            return error("strands: the agent is waiting for interrupt responses ([{interruptResponse = {interruptId, response}}]); call agent:clear_interrupts() to drop them")
+        end
+        for k, v in responses do self.interrupt_responses[k] = v end
+        resume = self.pending
+        self.pending = nil
+        prompt = nil
+    end
+    local new = messages.from_prompt(prompt)?
+    local bev = self.hooks:invoke("BeforeInvocationEvent", hooks_mod.event({agent = self, messages = new, invocation_state = ctx.invocation_state}))
+    for _, m in bev.messages or new do self:add_message(m, ctx) end
+    emit(ctx, {init_event_loop = true})
+    local r = run_loop(self, ctx, resume)
+    if not is_error(r) and r.stop_reason ~= "interrupt" then self.interrupt_responses = {} end
+    return r
+end
+
+-- {id → response} from [{interruptResponse = {interruptId, response}}], or nil
+function M.interrupt_responses(prompt)
+    if type(prompt) ~= "array" or len(prompt) == 0 then return nil end
+    local out = {}
+    for _, p in prompt do
+        if not util.is_record(p) or p.interruptResponse == nil then return nil end
+        out[p.interruptResponse.interruptId] = p.interruptResponse.response
+    end
+    return out
+end
+
+function Agent.clear_interrupts(self)
+    if self.pending ~= nil then
+        self.pending = nil
+        messages.repair(self.messages)
+    end
+    self.interrupt_responses = {}
+end
+
+-- agent:cancel() — stop the running invocation at the next step (a model
+-- stream stops reading, pending tools are not started); its result has
+-- stop_reason "cancelled". Safe to call from another goroutine.
+function Agent.cancel(self)
+    self.cancelled = true
+end
+
+-- agent:stream(prompt [, opts]) → channel of events
+-- Runs the invocation in a goroutine; every callback event goes to the
+-- channel, the last one is {result = result} or {error = err}.
+--   for e in agent:stream("oi") do if e.data then io.write(e.data) end end
+function Agent.stream(self, prompt, opts)
+    local ch = chan(64)
+    local o = util.merge(opts)
+    local extra = o.callback_handler
+    o.callback_handler = function(e)
+        if extra ~= nil then extra(e) end
+        if e.result == nil then ch <- e end
+    end
+    go (function()
+        local r = self:invoke(prompt, o)
+        local last = {}
+        if is_error(r) then last.error = r else last.result = r end
+        ch <- last
+        close(ch)
+    end)()
+    return ch
+end
+
+-- ---- Structured output ----
+
+-- agent:structured_output(schema, prompt [, opts]) → value | error
+-- schema: a JSON Schema object, or tool-style inputs ({name = "string", ...}).
+-- The model answers through a "structured_output" tool whose input must
+-- match the schema; the validated value comes back.
+function Agent.structured_output(self, schema, prompt, opts)
+    local o = util.merge(opts)
+    o.structured_output = schema
+    local r = self:invoke(prompt, o)
+    if is_error(r) then return r end
+    return r.structured_output
+end
+
+function Agent.structured_unlocked(self, schema, prompt, opts)
+    local captured = nil
+    local input_schema = schema
+    if schema.type == nil or schema.properties == nil then
+        input_schema = tools_mod.object_schema(schema)?
+    end
+    local o = util.merge(opts)
+    o.structured_output = nil
+    local ctx = new_ctx(self, o)
+    -- the extra tool records the answer and ends the loop after its round
+    local so_tool = tools_mod.tool({
+        name = "structured_output",
+        description = "Give the final answer in this exact structure. Call this tool once, with every required field, when the answer is ready.",
+        input_schema = input_schema,
+        fn = function(input, tctx)
+            captured = input
+            ctx.stop = true
+            return "Structured output recorded."
+        end,
+    })?
+    ctx.extra_tools = [so_tool]
+    local new = messages.from_prompt(prompt)?
+    local bev = self.hooks:invoke("BeforeInvocationEvent", hooks_mod.event({agent = self, messages = new, invocation_state = ctx.invocation_state}))
+    for _, m in bev.messages or new do self:add_message(m, ctx) end
+    emit(ctx, {init_event_loop = true})
+    local r = run_loop(self, ctx, nil)
+    if is_error(r) then return r end
+    if captured == nil and r.stop_reason == "end_turn" then
+        -- the model answered in text: ask it to use the tool
+        local tc = {}
+        tc.name = "structured_output"
+        ctx.tool_choice = tc
+        self:add_message(messages.user("Format your previous answer with the structured_output tool now."), ctx)
+        r = run_loop(self, ctx, nil)
+        if is_error(r) then return r end
+    end
+    if captured == nil then
+        return error("strands: the model did not produce the structured output")
+    end
+    r.structured_output = captured
+    return r
+end
+
+-- ---- Direct tool calls ----
+
+-- agent:call_tool(name, input [, opts]) → tool result | error
+-- Runs a tool outside the loop (agent.tool.<name>(input) does the same).
+-- With record_direct_tool_call (default true; opts.record overrides) the
+-- call goes into the history so the model knows it happened.
+function Agent.call_tool(self, name, input, opts)
+    if self.running then return error("strands: cannot call a tool directly while the agent runs") end
+    local tool = self.tool_registry:get(name)
+    if tool == nil then return error(`strands: no tool '${name}'`) end
+    local use = {}
+    use.toolUseId = util.new_id("tooluse_")
+    use.name = name
+    use.input = input or {}
+    local ctx = new_ctx(self, {})
+    ctx.cycle_span = metrics_mod.span("direct_tool_call")
+    local result = run_tool(self, use, ctx)
+    if result == nil then return error(`strands: tool '${name}' was interrupted`) end
+    local record = self.record_direct_tool_call
+    if opts ~= nil and opts.record ~= nil then record = opts.record end
+    if record then
+        self:add_message(messages.user(`agent.tool.${name} direct tool call.\nInput parameters: ${json.encode(use.input)}`))
+        self:add_message(messages.assistant([messages.tool_use_block(use.toolUseId, name, use.input)]))
+        self:add_message(messages.user([messages.tool_result_block(result)]))
+        self:add_message(messages.assistant(`agent.tool.${name} was called.`))
+    end
+    return result
+end
+
+-- ---- Agents as tools ----
+
+-- agent:as_tool([{name, description, preserve_context}]) → tool
+-- Another agent can call this one: the tool takes {input = "..."} and
+-- returns this agent's answer. Each call starts a fresh conversation unless
+-- preserve_context = true.
+function Agent.as_tool(self, opts)
+    opts = opts or {}
+    local name = opts.name or string.lower(re.gsub("[^A-Za-z0-9_-]+", self.name, "_"))
+    local desc = opts.description or (self.description ~= "" and self.description or `Ask the agent ${self.name}`)
+    return tools_mod.tool({
+        name = name,
+        description = desc,
+        inputs = {input = {type = "string", description = "The request for the agent"}},
+        fn = function(input, ctx)
+            local target = self
+            if not opts.preserve_context then target = self:spawn({}) end
+            local r = target:invoke(input.input, {state = ctx.invocation_state})
+            if is_error(r) then return r end
+            return r.text
+        end,
+    })
+end
+
+-- agent:spawn(overrides) → a new agent with this one's settings (model,
+-- system prompt, tools, limits) and an empty conversation
+function Agent.spawn(self, overrides)
+    local o = util.merge(self.opts)
+    o.messages = []
+    o.session_manager = nil
+    o.hooks = []
+    o.state = nil
+    local ts = []
+    for _, n in self.tool_registry:names() do ts[] = self.tool_registry:get(n) end
+    o.tools = ts
+    o.model = self.model
+    o.system_prompt = self.system_prompt
+    o.callback_handler = false
+    o.conversation_manager = nil
+    for k, v in overrides or {} do o[k] = v end
+    return M.agent(o)
+end
+
+return M

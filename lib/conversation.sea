@@ -1,0 +1,263 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- conversation — keep the history inside the model's context
+--
+-- A conversation manager has
+--   cm:apply_management(agent)        after each invocation (and, with
+--                                     per_turn, before model calls)
+--   cm:reduce_context(agent, err)     when the model reports a context
+--                                     overflow; true | error (cannot reduce)
+--   cm:get_state() / cm:restore(state) for sessions
+--   cm.removed_message_count          messages dropped so far
+--
+-- strands.conversation.null()             never changes the history
+-- strands.conversation.sliding_window({window_size = 40,
+--     should_truncate_results = true, per_turn = false})
+-- strands.conversation.summarizing({summary_ratio = 0.3,
+--     preserve_recent_messages = 10, summarization_system_prompt,
+--     summarization_agent})
+-- The history is changed in place: agent.messages stays the same array.
+
+local util = require("./util")
+local messages = require("./messages")
+
+local M = {}
+
+local function has_tool_result(m)
+    return m ~= nil and len(messages.tool_results(m)) > 0
+end
+
+local function has_tool_use(m)
+    return m ~= nil and len(messages.tool_uses(m)) > 0
+end
+
+-- drop the first n messages of the array, in place
+local function drop_first(arr, n)
+    for _ = 1, n do del arr[0] end
+end
+
+-- A cut at index i keeps messages[i:]. It must not start on tool results
+-- (their toolUse would be gone) nor on an assistant toolUse whose results
+-- are missing. Returns the next valid cut at or after i, or nil.
+local function valid_cut(msgs, i)
+    while i < len(msgs) do
+        local m = msgs[i]
+        if has_tool_result(m) then
+            i += 1
+        elseif has_tool_use(m) and not has_tool_result(msgs[i + 1]) then
+            i += 1
+        else
+            return i
+        end
+    end
+    return nil
+end
+
+-- ---- Null ----
+
+local Null = {}
+
+function M.null()
+    local c = {}
+    c.removed_message_count = 0
+    c.kind = "null"
+    return util.with_methods(c, Null)
+end
+
+function Null.apply_management(self, agent) end
+function Null.reduce_context(self, agent, err)
+    return err or error("strands: the conversation is too long and the null conversation manager keeps all of it")
+end
+function Null.get_state(self)
+    local s = {}
+    s.kind = "null"
+    s.removed_message_count = self.removed_message_count
+    return s
+end
+function Null.restore(self, s) self.removed_message_count = s.removed_message_count or 0 end
+
+-- ---- Sliding window ----
+
+local Sliding = {}
+
+function M.sliding_window(opts)
+    opts = opts or {}
+    local c = {}
+    c.kind = "sliding_window"
+    c.window_size = opts.window_size or 40
+    c.should_truncate_results = opts.should_truncate_results ~= false
+    c.per_turn = opts.per_turn or false
+    c.max_result_chars = opts.max_result_chars or 2000
+    c.removed_message_count = 0
+    return util.with_methods(c, Sliding)
+end
+
+function Sliding.apply_management(self, agent)
+    if len(agent.messages) > self.window_size then
+        local r = self:trim(agent, nil)
+        if is_error(r) then return r end
+    end
+    return true
+end
+
+-- shorten the oldest large tool result; true if something changed
+function Sliding.truncate_results(self, agent)
+    for _, m in agent.messages do
+        for _, b in m.content do
+            local r = b.toolResult
+            if r ~= nil and not r.truncated then
+                local text = messages.result_text(r)
+                if len(text) > self.max_result_chars then
+                    local head = utf8.sub(text, 1, self.max_result_chars // 2)
+                    local tail_len = self.max_result_chars // 4
+                    local tail = utf8.sub(text, utf8.len(text) - tail_len + 1)
+                    r.content = [messages.text_block(`${head}\n<truncated chars="${utf8.len(text) - utf8.len(head) - utf8.len(tail)}"/>\n${tail}`)]
+                    r.truncated = true
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+function Sliding.trim(self, agent, err)
+    local msgs = agent.messages
+    local cut = len(msgs) > self.window_size and len(msgs) - self.window_size or 2
+    cut = valid_cut(msgs, cut)
+    if cut == nil or cut >= len(msgs) then
+        return err or error("strands: unable to trim the conversation to fit the context window")
+    end
+    drop_first(msgs, cut)
+    self.removed_message_count += cut
+    return true
+end
+
+function Sliding.reduce_context(self, agent, err)
+    if self.should_truncate_results and self:truncate_results(agent) then return true end
+    return self:trim(agent, err)
+end
+
+function Sliding.get_state(self)
+    local s = {}
+    s.kind = "sliding_window"
+    s.removed_message_count = self.removed_message_count
+    return s
+end
+function Sliding.restore(self, s) self.removed_message_count = s.removed_message_count or 0 end
+
+-- ---- Summarizing ----
+
+local DEFAULT_SUMMARY_PROMPT = [[You are a conversation summarizer. Summarize the conversation you are given so that it can replace the original messages.
+- Write in the third person, as concise bullet points.
+- Keep every fact, decision, number, name and open question that later turns may need.
+- Keep the results of tool calls that matter, and which tools were used.
+- Write in the language of the conversation.
+Answer with the summary only.]]
+
+local Summ = {}
+
+function M.summarizing(opts)
+    opts = opts or {}
+    if opts.summarization_agent ~= nil and opts.summarization_system_prompt ~= nil then
+        return error("strands: give summarization_agent or summarization_system_prompt, not both")
+    end
+    local c = {}
+    c.kind = "summarizing"
+    local ratio = opts.summary_ratio or 0.3
+    if ratio < 0.1 then ratio = 0.1 end
+    if ratio > 0.8 then ratio = 0.8 end
+    c.summary_ratio = ratio
+    c.preserve_recent_messages = opts.preserve_recent_messages or 10
+    c.summarization_system_prompt = opts.summarization_system_prompt or DEFAULT_SUMMARY_PROMPT
+    c.summarization_agent = opts.summarization_agent
+    c.summary_message = nil
+    c.removed_message_count = 0
+    c.per_turn = false
+    return util.with_methods(c, Summ)
+end
+
+function Summ.apply_management(self, agent) return true end
+
+function Summ.reduce_context(self, agent, err)
+    local msgs = agent.messages
+    local count = math.floor(len(msgs) * self.summary_ratio)
+    if count < 1 then count = 1 end
+    if count > len(msgs) - self.preserve_recent_messages then count = len(msgs) - self.preserve_recent_messages end
+    if count <= 0 then
+        return err or error("strands: cannot summarize: too few messages beyond preserve_recent_messages")
+    end
+    local cut = valid_cut(msgs, count)
+    if cut == nil or cut >= len(msgs) then
+        return err or error("strands: cannot summarize without splitting a tool call from its result")
+    end
+    local old = list.slice(msgs, 0, cut)
+    local summary = self:summarize(agent, old)
+    if is_error(summary) then return summary end
+    drop_first(msgs, cut)
+    -- the summary goes first, as a user message
+    local sm = messages.user(`Summary of the earlier conversation:\n${summary}`)
+    msgs[] = sm
+    local j = len(msgs) - 1
+    while j > 0 do
+        msgs[j] = msgs[j - 1]
+        j -= 1
+    end
+    msgs[0] = sm
+    -- a user message must not follow another: merge the summary into it
+    if len(msgs) > 1 and msgs[1].role == "user" and not has_tool_result(msgs[1]) then
+        for _, b in msgs[1].content do sm.content[] = b end
+        drop_first(msgs, 1)
+        msgs[] = sm
+        local k = len(msgs) - 1
+        while k > 0 do
+            msgs[k] = msgs[k - 1]
+            k -= 1
+        end
+        msgs[0] = sm
+    end
+    self.summary_message = sm
+    self.removed_message_count += cut
+    return true
+end
+
+-- summarize messages with a separate agent (the given one, or a copy of
+-- the main agent's model with no tools)
+function Summ.summarize(self, agent, old)
+    local transcript = []
+    for _, m in old do
+        for _, b in m.content do
+            if b.text ~= nil then
+                transcript[] = `${m.role}: ${b.text}`
+            elseif b.toolUse ~= nil then
+                transcript[] = `${m.role} called tool ${b.toolUse.name} with ${json.encode(b.toolUse.input)}`
+            elseif b.toolResult ~= nil then
+                transcript[] = `tool result (${b.toolResult.status}): ${util.truncate(messages.result_text(b.toolResult), 4000)}`
+            end
+        end
+    end
+    local summarizer = self.summarization_agent
+    if summarizer == nil then
+        summarizer = agent:spawn({system_prompt = self.summarization_system_prompt, tools = [], callback_handler = false})
+    else
+        summarizer.messages = []
+    end
+    local res = summarizer:invoke(`Summarize this conversation:\n\n${string.join(transcript, "\n")}`)
+    if is_error(res) then return error(`strands: summarization failed: ${res.message}`) end
+    return res.text
+end
+
+function Summ.get_state(self)
+    local s = {}
+    s.kind = "summarizing"
+    s.removed_message_count = self.removed_message_count
+    s.summary_message = self.summary_message
+    return s
+end
+function Summ.restore(self, s)
+    self.removed_message_count = s.removed_message_count or 0
+    self.summary_message = s.summary_message
+end
+
+return M

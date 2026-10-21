@@ -1,0 +1,91 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- util — small helpers shared by the strands modules
+
+local M = {}
+
+function M.is_record(v)
+    local t = type(v)
+    return t == "table" or t == "struct" or t == "map"
+end
+
+-- copy the methods of a class table into an object
+function M.with_methods(obj, methods)
+    for k, f in methods do obj[k] = f end
+    return obj
+end
+
+-- deep copy through JSON-like values (tables, maps, structs, arrays); the
+-- result is made of plain tables and arrays, so it can be changed freely
+function M.copy(v)
+    local t = type(v)
+    if t == "array" then
+        local out = []
+        for _, x in v do out[] = M.copy(x) end
+        return out
+    end
+    if t == "table" or t == "struct" or t == "map" then
+        local out = {}
+        for k, x in v do out[k] = M.copy(x) end
+        return out
+    end
+    return v
+end
+
+-- shallow merge of option tables (later wins), into a fresh table
+function M.merge(...)
+    local out = {}
+    for _, t in [...] do
+        if t ~= nil then
+            for k, v in t do out[k] = v end
+        end
+    end
+    return out
+end
+
+-- ---- Errors with a kind ----
+--
+-- Sea errors carry only a message, so strands prefixes it with the kind:
+-- "[throttled] HTTP 429 ...". kind_of(e) reads it back. Kinds used:
+--   throttled                the provider asked to slow down (retried)
+--   context_window_overflow  the conversation no longer fits (reduced, retried)
+--   model                    any other provider failure
+--   max_tokens               the answer was cut by the token limit
+--   tool                     a tool failed
+--   cancelled                agent:cancel() stopped the run
+
+function M.err(kind, msg)
+    return error(`[${kind}] ${msg}`)
+end
+
+function M.kind_of(e)
+    if not is_error(e) then return nil end
+    local m = re.captures("^\\[([a-z_]+)\\] ", e.message)
+    return m and m[1] or nil
+end
+
+-- the message without the [kind] prefix
+function M.message_of(e)
+    if not is_error(e) then return tostring(e) end
+    return re.gsub("^\\[[a-z_]+\\] ", e.message, "", 1)
+end
+
+-- a monotonic-enough millisecond clock for latencies
+function M.now_ms()
+    return math.floor(time.now():unix_nano() / 1000000)
+end
+
+function M.new_id(prefix)
+    return (prefix or "") .. string.replace(os.uuid(), "-", "")
+end
+
+-- text truncated to n bytes on a UTF-8 boundary, with a marker
+function M.truncate(s, n)
+    if len(s) <= n then return s end
+    local cut = utf8.sub(s, 1, n)
+    while len(cut) > n do cut = utf8.sub(cut, 1, utf8.len(cut) - 1) end
+    return cut .. `… <truncated chars="${utf8.len(s) - utf8.len(cut)}"/>`
+end
+
+return M

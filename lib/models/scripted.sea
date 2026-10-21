@@ -1,0 +1,143 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- models/scripted — a model that plays back prepared answers
+--
+-- For tests and offline examples: each model call takes the next answer.
+--
+--   local model = strands.models.scripted([
+--       {tool = "calculator", input = {expression = "2 + 2"}},   -- a tool call
+--       "The answer is 4.",                                    -- a text answer
+--   ])
+--
+-- An answer is:
+--   "text"                                       a text reply (end_turn)
+--   {text = "...", tools = [{name, input, id}]}  text and/or tool calls
+--   {tool = "name", input = {...}}               one tool call
+--   {error = "[throttled] ..."}                  the call fails with that error
+--   {stop_reason = "max_tokens", text = "..."}   any stop reason
+--   {reasoning = "...", text = "..."}            a reasoning block too
+--   function(request) → answer                   computed from the request
+-- model.requests keeps every request; when the answers run out the model
+-- replies "(no more scripted answers)".
+
+local util = require("../util")
+
+local M = {}
+
+local Model = {}
+
+function M.model(answers, opts)
+    local m = {}
+    m.provider = "scripted"
+    m.model_id = "scripted"
+    m.answers = answers or []
+    m.next = 0
+    m.requests = []
+    m.usage = opts and opts.usage or nil
+    m.chunk = opts and opts.chunk or 8 -- text delta size, in characters
+    return util.with_methods(m, Model)
+end
+
+function Model.config(self)
+    local c = {}
+    c.provider = "scripted"
+    c.model_id = "scripted"
+    return c
+end
+
+function Model.update_config(self, changes) end
+
+-- add more answers
+function Model.push(self, ...)
+    for _, a in [...] do self.answers[] = a end
+end
+
+local function ev1(k, v)
+    local e = {}
+    e[k] = v
+    return e
+end
+
+local function delta(d)
+    local x = {}
+    x.delta = d
+    return ev1("contentBlockDelta", x)
+end
+
+function Model.stream(self, req, emit)
+    self.requests[] = util.copy(req)
+    local a = self.answers[self.next]
+    self.next += 1
+    if a == nil then a = "(no more scripted answers)" end
+    if type(a) == "function" then a = a(req) end
+    if type(a) == "string" then
+        local t = {}
+        t.text = a
+        a = t
+    end
+    if a.error ~= nil then return error(a.error) end
+    local ms = {}
+    ms.role = "assistant"
+    emit(ev1("messageStart", ms))
+    if a.reasoning ~= nil then
+        emit(ev1("contentBlockStart", {start = {}}))
+        local rc = {}
+        rc.text = a.reasoning
+        local d = {}
+        d.reasoningContent = rc
+        emit(delta(d))
+        emit(ev1("contentBlockStop", {}))
+    end
+    if a.text ~= nil and a.text ~= "" then
+        emit(ev1("contentBlockStart", {start = {}}))
+        local n = utf8.len(a.text)
+        local i = 1
+        while i <= n do
+            local d = {}
+            d.text = utf8.sub(a.text, i, i + self.chunk - 1)
+            emit(delta(d))
+            i += self.chunk
+        end
+        emit(ev1("contentBlockStop", {}))
+    end
+    local calls = a.tools or []
+    if a.tool ~= nil then
+        local c = {}
+        c.name = a.tool
+        c.input = a.input or {}
+        c.id = a.id
+        calls = [c]
+    end
+    for i, c in calls do
+        local tu = {}
+        tu.toolUseId = c.id or `tooluse_${self.next}_${i}`
+        tu.name = c.name
+        local st = {}
+        st.toolUse = tu
+        local cs = {}
+        cs.start = st
+        emit(ev1("contentBlockStart", cs))
+        local ti = {}
+        ti.input = type(c.input) == "string" and c.input or json.encode(c.input or {})
+        local d = {}
+        d.toolUse = ti
+        emit(delta(d))
+        emit(ev1("contentBlockStop", {}))
+    end
+    local stop = a.stop_reason or (len(calls) > 0 and "tool_use" or "end_turn")
+    local mst = {}
+    mst.stopReason = stop
+    emit(ev1("messageStop", mst))
+    local u = {}
+    local usage = a.usage or self.usage
+    u.inputTokens = usage and usage.input or 10
+    u.outputTokens = usage and usage.output or 5
+    u.totalTokens = u.inputTokens + u.outputTokens
+    local md = {}
+    md.usage = u
+    emit(ev1("metadata", md))
+    return true
+end
+
+return M

@@ -1,0 +1,45 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- strands — Strands Agents in Sea
+--
+-- A model-driven agent framework after Strands Agents
+-- (https://github.com/strands-agents/harness-sdk), written in Sea, with
+-- Maritaca AI (Sabiá) as the default model provider.
+--
+--   local strands = require("../strands/strands")
+--   local agent = strands.agent({system_prompt = "Responda em português."})
+--   print(agent:invoke("Olá!")?.text)
+
+local agent_mod = require("./lib/agent")
+local tools = require("./lib/tools")
+local messages = require("./lib/messages")
+local hooks = require("./lib/hooks")
+local conversation = require("./lib/conversation")
+local handlers = require("./lib/handlers")
+local util = require("./lib/util")
+
+local M = {}
+
+M.VERSION = "0.1.0"
+
+M.agent = agent_mod.agent
+M.tool = tools.tool
+
+M.models = {}
+M.models.maritaca = require("./lib/models/maritaca").model
+M.models.openai = require("./lib/models/openai").model
+M.models.scripted = require("./lib/models/scripted").model
+
+M.messages = messages
+M.hooks = hooks
+M.conversation = conversation
+M.handlers = handlers
+M.tools = tools
+
+-- the kind of a strands error ("throttled", "context_window_overflow",
+-- "model", "max_tokens", ...) and its message without the kind
+M.error_kind = util.kind_of
+M.error_message = util.message_of
+
+return M

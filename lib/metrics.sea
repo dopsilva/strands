@@ -1,0 +1,102 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- metrics — what an invocation cost: cycles, tokens, latency, tool calls,
+-- and a trace of spans (invocation → cycles → model calls and tools)
+
+local util = require("./util")
+
+local M = {}
+
+local Metrics = {}
+
+function M.new()
+    local m = {}
+    m.cycle_count = 0
+    m.cycle_durations = []
+    local u = {}
+    u.inputTokens = 0
+    u.outputTokens = 0
+    u.totalTokens = 0
+    m.accumulated_usage = u
+    local am = {}
+    am.latencyMs = 0
+    m.accumulated_metrics = am
+    m.tool_metrics = {}
+    m.traces = []
+    m.model_calls = 0
+    return util.with_methods(m, Metrics)
+end
+
+function Metrics.add_usage(self, usage, metrics)
+    if usage ~= nil then
+        self.accumulated_usage.inputTokens += usage.inputTokens or 0
+        self.accumulated_usage.outputTokens += usage.outputTokens or 0
+        self.accumulated_usage.totalTokens += usage.totalTokens or 0
+    end
+    if metrics ~= nil and metrics.latencyMs ~= nil then
+        self.accumulated_metrics.latencyMs += metrics.latencyMs
+    end
+    self.model_calls += 1
+end
+
+function Metrics.add_tool(self, name, ok, ms)
+    local t = self.tool_metrics[name]
+    if t == nil then
+        t = {}
+        t.call_count = 0
+        t.success_count = 0
+        t.error_count = 0
+        t.total_time_ms = 0
+        self.tool_metrics[name] = t
+    end
+    t.call_count += 1
+    if ok then t.success_count += 1 else t.error_count += 1 end
+    t.total_time_ms += ms
+end
+
+-- ---- Trace spans ----
+
+function M.span(name, attrs)
+    local s = {}
+    s.name = name
+    s.start_ms = util.now_ms()
+    s.end_ms = nil
+    s.attributes = {}
+    for k, v in attrs or {} do s.attributes[k] = v end
+    s.children = []
+    return s
+end
+
+function M.end_span(s, attrs)
+    s.end_ms = util.now_ms()
+    s.duration_ms = s.end_ms - s.start_ms
+    for k, v in attrs or {} do s.attributes[k] = v end
+    return s
+end
+
+-- metrics:summary() → a plain table (for logs and JSON)
+function Metrics.summary(self)
+    local tools = {}
+    for name, t in self.tool_metrics do
+        local x = {}
+        x.call_count = t.call_count
+        x.success_count = t.success_count
+        x.error_count = t.error_count
+        x.total_time_ms = t.total_time_ms
+        x.average_time_ms = t.call_count > 0 and t.total_time_ms / t.call_count or 0
+        x.success_rate = t.call_count > 0 and t.success_count / t.call_count or 0
+        tools[name] = x
+    end
+    local s = {}
+    s.total_cycles = self.cycle_count
+    s.total_duration_ms = list.sum(self.cycle_durations)
+    s.model_calls = self.model_calls
+    s.accumulated_usage = util.copy(self.accumulated_usage)
+    s.accumulated_metrics = util.copy(self.accumulated_metrics)
+    s.tool_usage = tools
+    s.traces = util.copy(self.traces)
+    return s
+end
+
+return M

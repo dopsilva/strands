@@ -1,0 +1,437 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- models/openai — any OpenAI-compatible Chat Completions API
+--
+--   local model = strands.models.openai({
+--       base_url = "https://api.openai.com/v1",   -- POST {base_url}/chat/completions
+--       api_key = os.getenv("OPENAI_API_KEY"),
+--       model_id = "gpt-4o",
+--       params = {temperature = 0.3, max_tokens = 1024},
+--   })
+--
+-- Options:
+--   base_url, api_key, model_id   endpoint, bearer key, model name
+--   params        extra request fields (temperature, max_tokens, top_p, ...)
+--   headers       extra HTTP headers
+--   stream        true (default): Server-Sent Events, text as it arrives
+--   stream_usage  true (default): ask for token usage in the stream
+--                 (stream_options.include_usage)
+--   timeout       per network operation, in milliseconds (default 120000)
+-- Maritaca, Ollama (base_url http://localhost:11434/v1), vLLM, Groq and
+-- others speak this API; models/maritaca.sea sets Maritaca's defaults.
+
+local util = require("../util")
+local messages = require("../messages")
+local deps = require("../deps")
+
+local M = {}
+
+local Model = {}
+
+function M.model(opts)
+    opts = opts or {}
+    local m = {}
+    m.provider = opts.provider or "openai"
+    m.base_url = string.trim(opts.base_url or "https://api.openai.com/v1")
+    while string.ends_with(m.base_url, "/") do m.base_url = string.sub(m.base_url, 1, len(m.base_url) - 1) end
+    m.api_key = opts.api_key
+    m.model_id = opts.model_id or "gpt-4o"
+    m.params = opts.params or {}
+    m.headers = opts.headers or {}
+    m.stream_mode = opts.stream ~= false
+    m.stream_usage = opts.stream_usage ~= false
+    m.timeout = opts.timeout or 120000
+    m.http = opts.http or deps.http
+    return util.with_methods(m, Model)
+end
+
+-- model:config() → the settings (without the key)
+function Model.config(self)
+    local c = {}
+    c.provider = self.provider
+    c.model_id = self.model_id
+    c.base_url = self.base_url
+    c.params = self.params
+    return c
+end
+
+function Model.update_config(self, changes)
+    for k, v in changes do
+        if k == "params" then
+            for pk, pv in v do self.params[pk] = pv end
+        else
+            self[k] = v
+        end
+    end
+end
+
+-- ---- Request ----
+
+local function image_part(img)
+    local fmt = img.format or "png"
+    local src = img.source or {}
+    local url = src.url
+    if url == nil and src.bytes ~= nil then
+        url = `data:image/${fmt};base64,${encoding.base64_encode(src.bytes)}`
+    end
+    local iu = {}
+    iu.url = url
+    local p = {}
+    p.type = "image_url"
+    p.image_url = iu
+    return p
+end
+
+-- a user message: tool results become "tool" messages (they must follow the
+-- assistant message right away), the rest one "user" message
+local function format_user(msg, out)
+    local parts = []
+    local only_text = true
+    for _, b in msg.content do
+        if b.toolResult ~= nil then
+            local tm = {}
+            tm.role = "tool"
+            tm.tool_call_id = b.toolResult.toolUseId
+            local text = messages.result_text(b.toolResult)
+            if b.toolResult.status == "error" and not string.starts_with(text, "Error") then text = "Error: " .. text end
+            tm.content = text
+            out[] = tm
+        elseif b.text ~= nil then
+            local p = {}
+            p.type = "text"
+            p.text = b.text
+            parts[] = p
+        elseif b.image ~= nil then
+            parts[] = image_part(b.image)
+            only_text = false
+        elseif b.document ~= nil then
+            local p = {}
+            p.type = "text"
+            local d = b.document
+            p.text = `[document ${d.name or ""}]\n${d.source and d.source.bytes or ""}`
+            parts[] = p
+        end
+    end
+    if len(parts) == 0 then return end
+    local um = {}
+    um.role = "user"
+    if only_text then
+        local texts = []
+        for _, p in parts do texts[] = p.text end
+        um.content = string.join(texts, "\n")
+    else
+        um.content = parts
+    end
+    out[] = um
+end
+
+local function format_assistant(msg, out)
+    local texts = []
+    local calls = []
+    for _, b in msg.content do
+        if b.text ~= nil then
+            texts[] = b.text
+        elseif b.toolUse ~= nil then
+            local f = {}
+            f.name = b.toolUse.name
+            f.arguments = json.encode(b.toolUse.input or {})
+            local c = {}
+            c.id = b.toolUse.toolUseId
+            c.type = "function"
+            c["function"] = f
+            calls[] = c
+        end
+    end
+    local am = {}
+    am.role = "assistant"
+    am.content = len(texts) > 0 and string.join(texts, "") or nil
+    if len(calls) > 0 then am.tool_calls = calls end
+    if am.content == nil and len(calls) == 0 then am.content = "" end
+    out[] = am
+end
+
+-- the Chat Completions request body for a strands request
+function Model.format_request(self, req)
+    local msgs = []
+    if req.system_prompt ~= nil and req.system_prompt ~= "" then
+        local sm = {}
+        sm.role = "system"
+        sm.content = req.system_prompt
+        msgs[] = sm
+    end
+    for _, m in req.messages do
+        if m.role == "user" then
+            format_user(m, msgs)
+        else
+            format_assistant(m, msgs)
+        end
+    end
+    local body = {}
+    for k, v in self.params do body[k] = v end
+    body.model = self.model_id
+    body.messages = msgs
+    if req.tool_specs ~= nil and len(req.tool_specs) > 0 then
+        local tools = []
+        for _, s in req.tool_specs do
+            local f = {}
+            f.name = s.name
+            f.description = s.description
+            f.parameters = s.inputSchema.json
+            local t = {}
+            t.type = "function"
+            t["function"] = f
+            tools[] = t
+        end
+        body.tools = tools
+        if req.tool_choice ~= nil then
+            if type(req.tool_choice) == "string" then
+                body.tool_choice = req.tool_choice -- "auto" | "required" | "none"
+            else
+                local fc = {}
+                fc.name = req.tool_choice.name
+                local tc = {}
+                tc.type = "function"
+                tc["function"] = fc
+                body.tool_choice = tc
+            end
+        end
+    end
+    if self.stream_mode then
+        body.stream = true
+        if self.stream_usage then
+            local so = {}
+            so.include_usage = true
+            body.stream_options = so
+        end
+    end
+    return body
+end
+
+-- ---- Response ----
+
+local STOP = {stop = "end_turn", tool_calls = "tool_use", function_call = "tool_use", length = "max_tokens", content_filter = "content_filtered"}
+
+local function ev1(key, val)
+    local e = {}
+    e[key] = val
+    return e
+end
+
+-- turns OpenAI deltas into strands stream events
+local function converter(emit)
+    local s = {}
+    s.text_open = false
+    s.calls = [=] -- index → {id, name, args}
+    s.call_order = []
+    s.finish = nil
+    s.usage = nil
+    s.started = false
+    function s.start()
+        if s.started then return end
+        s.started = true
+        local ms = {}
+        ms.role = "assistant"
+        emit(ev1("messageStart", ms))
+    end
+    function s.close_text()
+        if s.text_open then
+            emit(ev1("contentBlockStop", {}))
+            s.text_open = false
+        end
+    end
+    function s.text(t)
+        if t == nil or t == "" then return end
+        s.start()
+        if not s.text_open then
+            local st = {}
+            st.start = {}
+            emit(ev1("contentBlockStart", st))
+            s.text_open = true
+        end
+        local d = {}
+        d.text = t
+        local dd = {}
+        dd.delta = d
+        emit(ev1("contentBlockDelta", dd))
+    end
+    function s.reasoning(t)
+        if t == nil or t == "" then return end
+        s.start()
+        local rc = {}
+        rc.text = t
+        local d = {}
+        d.reasoningContent = rc
+        local dd = {}
+        dd.delta = d
+        emit(ev1("contentBlockDelta", dd))
+    end
+    function s.tool_delta(tc)
+        s.start()
+        local idx = tc.index or len(s.call_order)
+        local c = s.calls[idx]
+        if c == nil then
+            c = {}
+            c.id = nil
+            c.name = ""
+            c.args = ""
+            s.calls[idx] = c
+            s.call_order[] = idx
+        end
+        if tc.id ~= nil and tc.id ~= "" then c.id = tc.id end
+        local f = tc["function"]
+        if f ~= nil then
+            if f.name ~= nil then c.name ..= f.name end
+            if f.arguments ~= nil then
+                if type(f.arguments) == "string" then c.args ..= f.arguments else c.args = json.encode(f.arguments) end
+            end
+        end
+    end
+    function s.done()
+        s.start()
+        s.close_text()
+        for _, idx in s.call_order do
+            local c = s.calls[idx]
+            local tu = {}
+            tu.toolUseId = c.id or util.new_id("call_")
+            tu.name = c.name
+            local start = {}
+            start.toolUse = tu
+            local cs = {}
+            cs.start = start
+            emit(ev1("contentBlockStart", cs))
+            local tin = {}
+            tin.input = c.args
+            local d = {}
+            d.toolUse = tin
+            local dd = {}
+            dd.delta = d
+            emit(ev1("contentBlockDelta", dd))
+            emit(ev1("contentBlockStop", {}))
+        end
+        local stop = STOP[s.finish or ""] or (len(s.call_order) > 0 and "tool_use" or "end_turn")
+        if len(s.call_order) > 0 and stop == "end_turn" then stop = "tool_use" end
+        local mst = {}
+        mst.stopReason = stop
+        emit(ev1("messageStop", mst))
+        if s.usage ~= nil then
+            local u = {}
+            u.inputTokens = s.usage.prompt_tokens or 0
+            u.outputTokens = s.usage.completion_tokens or 0
+            u.totalTokens = s.usage.total_tokens or (u.inputTokens + u.outputTokens)
+            local md = {}
+            md.usage = u
+            emit(ev1("metadata", md))
+        end
+    end
+    function s.chunk(obj)
+        if obj.usage ~= nil then s.usage = obj.usage end
+        for _, ch in obj.choices or [] do
+            local d = ch.delta or ch.message or {}
+            local rc = d.reasoning_content or d.reasoning
+            if type(rc) == "string" then s.reasoning(rc) end
+            if type(d.content) == "string" then s.text(d.content) end
+            if type(d.tool_calls) == "array" then
+                for _, tc in d.tool_calls do s.tool_delta(tc) end
+            end
+            if ch.finish_reason ~= nil then s.finish = ch.finish_reason end
+        end
+    end
+    return s
+end
+
+-- an HTTP failure as a strands error with a kind
+local function http_error(self, resp)
+    local status = resp.status
+    local body = resp.body or ""
+    local detail = body
+    local parsed = json.decode(body)
+    if not is_error(parsed) and util.is_record(parsed) then
+        if util.is_record(parsed.error) and parsed.error.message ~= nil then
+            detail = parsed.error.message
+        elseif parsed.detail ~= nil then
+            detail = type(parsed.detail) == "string" and parsed.detail or json.encode(parsed.detail)
+        elseif parsed.message ~= nil then
+            detail = parsed.message
+        end
+    end
+    local msg = `${self.provider} HTTP ${status}: ${detail}`
+    if status == 0 then return util.err("model", `${self.provider}: ${resp.error or "request failed"}`) end
+    if status == 429 or status == 502 or status == 503 or status == 504 or status == 529 then
+        return util.err("throttled", msg)
+    end
+    local low = string.lower(detail)
+    if status == 400 or status == 413 then
+        for _, w in ["context length", "context_length", "maximum context", "too many tokens", "context window", "prompt is too long", "input is too long", "tokens exceed"] do
+            if string.contains(low, w) then return util.err("context_window_overflow", msg) end
+        end
+    end
+    return util.err("model", msg)
+end
+
+-- model:stream(request, emit) → true | error
+function Model.stream(self, req, emit)
+    if self.api_key == nil or self.api_key == "" then
+        return util.err("model", `${self.provider}: missing API key`)
+    end
+    local body = self:format_request(req)
+    local headers = {}
+    for k, v in self.headers do headers[k] = v end
+    headers["Authorization"] = "Bearer " .. self.api_key
+    local conv = converter(emit)
+    local url = self.base_url .. "/chat/completions"
+    if not self.stream_mode then
+        local resp = self.http.post(url, nil, nil, {json = body, headers = headers, timeout = self.timeout})
+        if not resp.ok then return http_error(self, resp) end
+        local obj = json.decode(resp.body)
+        if is_error(obj) then return util.err("model", `${self.provider}: bad JSON response`) end
+        conv.chunk(obj)
+        conv.done()
+        return true
+    end
+    -- Server-Sent Events: "data: {...}\n\n" ... "data: [DONE]"
+    headers["Accept"] = "text/event-stream"
+    local buf = ""
+    local failed = nil
+    local finished = false
+    local function on_line(line)
+        if not string.starts_with(line, "data:") then return end
+        local payload = string.trim(string.sub(line, 6))
+        if payload == "[DONE]" then
+            finished = true
+            return
+        end
+        if payload == "" then return end
+        local obj = json.decode(payload)
+        if is_error(obj) then return end
+        if util.is_record(obj.error) then
+            failed = util.err("model", `${self.provider}: ${obj.error.message or json.encode(obj.error)}`)
+            return
+        end
+        conv.chunk(obj)
+    end
+    local resp = self.http.post(url, nil, nil, {
+        json = body,
+        headers = headers,
+        timeout = self.timeout,
+        on_data = function(piece)
+            buf ..= piece
+            while true do
+                local nl = string.find(buf, "\n")
+                if nl == nil then break end
+                local line = string.sub(buf, 1, nl - 1)
+                buf = string.sub(buf, nl + 1)
+                if string.ends_with(line, "\r") then line = string.sub(line, 1, len(line) - 1) end
+                on_line(line)
+                if failed ~= nil or finished then return false end
+            end
+        end,
+    })
+    if not resp.ok then return http_error(self, resp) end
+    if buf ~= "" and failed == nil and not finished then on_line(buf) end
+    if failed ~= nil then return failed end
+    conv.done()
+    return true
+end
+
+return M

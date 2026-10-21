@@ -1,0 +1,34 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- models/maritaca — Maritaca AI (Sabiá models, https://www.maritaca.ai)
+--
+--   local model = strands.models.maritaca({model_id = "sabia-4"})
+--
+-- The API is OpenAI-compatible at https://chat.maritaca.ai/api; the key
+-- comes from MARITACA_API_KEY (or api_key). Models:
+--   sabia-4            general purpose, 128k context (the default)
+--   sabiazinho-4       the fastest and cheapest, 128k context
+--   sabia-4-thinking   reasoning, 1M context
+-- Append "-br-sp" (sabia-4-br-sp) to run the inference inside Brazil.
+-- The other options are those of models/openai.sea (params, stream, timeout...).
+
+local util = require("../util")
+local openai = require("./openai")
+
+local M = {}
+
+M.BASE_URL = "https://chat.maritaca.ai/api"
+M.MODELS = ["sabia-4", "sabiazinho-4", "sabia-4-thinking"]
+
+function M.model(opts)
+    local o = util.merge({
+        provider = "maritaca",
+        base_url = os.getenv("MARITACA_BASE_URL") or M.BASE_URL,
+        api_key = os.getenv("MARITACA_API_KEY"),
+        model_id = os.getenv("MARITACA_MODEL") or "sabia-4",
+    }, opts)
+    return openai.model(o)
+end
+
+return M
