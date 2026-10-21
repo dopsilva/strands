@@ -80,6 +80,43 @@ function M.new_id(prefix)
     return (prefix or "") .. string.replace(os.uuid(), "-", "")
 end
 
+-- run fn() with a time limit: after ms milliseconds on_timeout() is called
+-- (it should make fn return soon, e.g. agent:cancel()) and fn's value is
+-- still awaited. Returns value, timed_out.
+function M.with_timeout(fn, ms, on_timeout)
+    if ms == nil or ms <= 0 then return fn(), false end
+    local done = chan(1)
+    local timer = chan(1)
+    local finished = false
+    go (function()
+        local v = fn()
+        finished = true
+        done <- v
+    end)()
+    -- sleep in slices so the timer goroutine ends soon after fn does (the
+    -- program waits for every goroutine before exiting)
+    go (function()
+        local left = ms
+        while left > 0 and not finished do
+            local step = left < 50 and left or 50
+            time.sleep(step * time.Millisecond)
+            left -= step
+        end
+        if not finished then timer <- true end
+    end)()
+    local value = nil
+    local timed_out = false
+    select
+        case v = <-done then
+            value = v
+        case _ = <-timer then
+            timed_out = true
+            on_timeout()
+            value = <-done
+    end
+    return value, timed_out
+end
+
 -- text truncated to n bytes on a UTF-8 boundary, with a marker
 function M.truncate(s, n)
     if len(s) <= n then return s end

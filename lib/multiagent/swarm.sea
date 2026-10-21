@@ -1,0 +1,240 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- multiagent/swarm — agents that hand a task to each other
+--
+--   local swarm = strands.swarm({
+--       agents = [pesquisador, redator, revisor],
+--       entry_point = "pesquisador",          -- default: the first agent
+--       max_handoffs = 20, max_iterations = 20,
+--       execution_timeout_ms = 900000, node_timeout_ms = 300000,
+--   })
+--   local r = swarm:invoke("Escreva um artigo sobre ...")?
+--   print(r.status, r.text)
+--
+-- Every agent gets a handoff_to_agent tool. The agent that holds the task
+-- works on it and either answers (the swarm ends) or hands it over with a
+-- message and context; the next agent's prompt carries the task, the
+-- handoff message, the agents that worked so far and the knowledge they
+-- shared. The result:
+--   status            "completed" | "failed"
+--   text              the last agent's answer
+--   node_history      the agent names in execution order
+--   results           name → that agent's last result
+--   accumulated_usage tokens of every call
+--   execution_count, execution_time_ms, error (when failed)
+
+local util = require("../util")
+local tools_mod = require("../tools")
+local hooks_mod = require("../hooks")
+
+local M = {}
+
+local Swarm = {}
+
+function M.swarm(opts)
+    opts = opts or {}
+    local s = {}
+    s.__is_multiagent = true
+    s.kind = "swarm"
+    s.nodes = [=]
+    s.order = []
+    for _, a in opts.agents or opts.nodes or [] do
+        if not (util.is_record(a) and a.__is_agent) then return error("strands: swarm agents must be agents") end
+        if s.nodes[a.name] ~= nil then return error(`strands: two swarm agents are named '${a.name}'`) end
+        s.nodes[a.name] = a
+        s.order[] = a.name
+    end
+    if len(s.order) == 0 then return error("strands: a swarm needs agents") end
+    s.entry_point = opts.entry_point or s.order[0]
+    if util.is_record(s.entry_point) then s.entry_point = s.entry_point.name end
+    if s.nodes[s.entry_point] == nil then return error(`strands: swarm entry point '${s.entry_point}' is not one of its agents`) end
+    s.max_handoffs = opts.max_handoffs or 20
+    s.max_iterations = opts.max_iterations or 20
+    s.execution_timeout_ms = opts.execution_timeout_ms or 900000
+    s.node_timeout_ms = opts.node_timeout_ms or 300000
+    s.repetitive_handoff_window = opts.repetitive_handoff_detection_window or 0
+    s.repetitive_handoff_min_unique = opts.repetitive_handoff_min_unique_agents or 0
+    s.hooks = hooks_mod.registry()
+    s.id = opts.id or "swarm"
+    s.name = opts.name or "swarm"
+    s.description = opts.description or ""
+    util.with_methods(s, Swarm)
+    for _, h in opts.hooks or [] do s.hooks:add_hook(h)? end
+    return s
+end
+
+-- the prompt for the agent that takes the task now
+local function node_prompt(self, st, name)
+    local parts = []
+    if st.handoff_message ~= nil then parts[] = `Handoff Message: ${st.handoff_message}\n` end
+    parts[] = `User Request: ${st.task}\n`
+    if len(st.history) > 0 then
+        parts[] = `Previous agents who worked on this: ${string.join(st.history, " → ")}\n`
+    end
+    local shared = list.keys(st.shared)
+    if len(shared) > 0 then
+        parts[] = "Shared knowledge from previous agents:"
+        for _, k in shared do parts[] = `• ${k}: ${json.encode(st.shared[k])}` end
+        parts[] = ""
+    end
+    local others = []
+    for _, n in self.order do
+        if n ~= name then
+            local a = self.nodes[n]
+            others[] = `Agent name: ${n}. Agent description: ${a.description ~= "" and a.description or "(none)"}`
+        end
+    end
+    if len(others) > 0 then
+        parts[] = "Other agents available for collaboration:"
+        for _, o in others do parts[] = o end
+        parts[] = ""
+    end
+    parts[] = "You have access to swarm coordination tools if you need help from other agents. If you don't hand off to another agent, the swarm will consider the task complete."
+    return string.join(parts, "\n")
+end
+
+local function handoff_tool(self, st, current)
+    return tools_mod.tool({
+        name = "handoff_to_agent",
+        description = "Transfer control to another agent in the swarm for specialized help.",
+        inputs = {
+            agent_name = {type = "string", description = "Name of the agent to hand off to"},
+            message = {type = "string", description = "Message explaining what needs to be done and why"},
+            context = {type = "object", description = "Additional context to share with the next agent", optional = true},
+        },
+        fn = function(input, ctx)
+            if self.nodes[input.agent_name] == nil then
+                return error(`agent '${input.agent_name}' is not in the swarm; agents: ${string.join(self.order, ", ")}`)
+            end
+            if input.agent_name == current then return error("you cannot hand off to yourself") end
+            local h = {}
+            h.agent = input.agent_name
+            h.message = input.message
+            st.next = h
+            if input.context ~= nil then
+                for k, v in input.context do st.shared[`${current}.${k}`] = v end
+            end
+            ctx.stop()
+            return `Handed off to ${input.agent_name}: ${input.message}`
+        end,
+    })
+end
+
+local function add_usage(total, u)
+    if u == nil then return end
+    total.inputTokens += u.inputTokens or 0
+    total.outputTokens += u.outputTokens or 0
+    total.totalTokens += u.totalTokens or 0
+end
+
+local function repetitive(self, history)
+    local w = self.repetitive_handoff_window
+    if w <= 0 or len(history) < w then return false end
+    local seen = [=]
+    for _, n in list.slice(history, len(history) - w) do seen[n] = true end
+    return len(list.keys(seen)) < self.repetitive_handoff_min_unique
+end
+
+-- swarm:invoke(task [, opts]) → result | error
+function Swarm.invoke(self, task, opts)
+    opts = opts or {}
+    local t0 = util.now_ms()
+    local st = {}
+    st.task = type(task) == "string" and task or json.encode(task)
+    st.history = []
+    st.shared = {}
+    st.next = nil
+    st.handoff_message = nil
+    local u = {}
+    u.inputTokens = 0
+    u.outputTokens = 0
+    u.totalTokens = 0
+    local result = {}
+    result.status = "completed"
+    result.node_history = st.history
+    result.results = {}
+    result.accumulated_usage = u
+    result.execution_count = 0
+    result.text = ""
+    local invocation_state = opts.state or {}
+    self.hooks:invoke("BeforeMultiAgentInvocationEvent", hooks_mod.event({source = self, invocation_state = invocation_state}))
+    local current = self.entry_point
+    local handoffs = 0
+    while true do
+        if result.execution_count >= self.max_iterations then
+            result.status = "failed"
+            result.error = `reached max_iterations (${self.max_iterations})`
+            break
+        end
+        if util.now_ms() - t0 > self.execution_timeout_ms then
+            result.status = "failed"
+            result.error = "execution timeout"
+            break
+        end
+        local bev = self.hooks:invoke("BeforeNodeCallEvent", hooks_mod.event({source = self, node_id = current, invocation_state = invocation_state, cancel = false}))
+        if bev.cancel ~= false and bev.cancel ~= nil then
+            result.status = "failed"
+            result.error = type(bev.cancel) == "string" and bev.cancel or `node '${current}' was cancelled by a hook`
+            break
+        end
+        local agent = self.nodes[current]
+        local tool = handoff_tool(self, st, current)?
+        agent:remove_tool("handoff_to_agent")
+        agent:add_tool(tool)?
+        st.next = nil
+        local prompt = node_prompt(self, st, current)
+        local r, timed_out = util.with_timeout(function() return agent:invoke(prompt, {state = invocation_state}) end,
+            self.node_timeout_ms, function() agent:cancel() end)
+        if timed_out then r = error(`node timeout after ${self.node_timeout_ms} ms`) end
+        agent:remove_tool("handoff_to_agent")
+        st.history[] = current
+        result.execution_count += 1
+        self.hooks:invoke("AfterNodeCallEvent", hooks_mod.event({source = self, node_id = current, result = r}))
+        if is_error(r) then
+            result.status = "failed"
+            result.error = `${current}: ${r.message}`
+            break
+        end
+        result.results[current] = r
+        add_usage(u, r.usage)
+        if st.next == nil then
+            result.text = r.text
+            break
+        end
+        handoffs += 1
+        if handoffs > self.max_handoffs then
+            result.status = "failed"
+            result.error = `reached max_handoffs (${self.max_handoffs})`
+            break
+        end
+        if repetitive(self, st.history) then
+            result.status = "failed"
+            result.error = "repetitive handoffs between too few agents"
+            break
+        end
+        st.handoff_message = st.next.message
+        current = st.next.agent
+    end
+    result.execution_time_ms = util.now_ms() - t0
+    self.hooks:invoke("AfterMultiAgentInvocationEvent", hooks_mod.event({source = self, result = result}))
+    return result
+end
+
+-- a swarm as a tool for another agent
+function Swarm.as_tool(self, opts)
+    opts = opts or {}
+    return tools_mod.tool({
+        name = opts.name or self.name,
+        description = opts.description or (self.description ~= "" and self.description or "A team of agents working on a task together"),
+        inputs = {input = {type = "string", description = "The task for the team"}},
+        fn = function(input, ctx)
+            local r = self:invoke(input.input, {state = ctx.invocation_state})
+            if is_error(r) then return r end
+            if r.status ~= "completed" then return error(r.error) end
+            return r.text
+        end,
+    })
+end
+
+return M

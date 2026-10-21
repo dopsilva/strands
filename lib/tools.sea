@@ -20,6 +20,7 @@
 --   ctx.tool_use          {toolUseId, name, input}
 --   ctx.agent             the agent running the tool
 --   ctx.invocation_state  the table passed to agent:invoke(prompt, {state = ...})
+--   ctx.stop()            end the agent loop after this round of tools
 -- and returns a string, any JSON value, a full tool result
 -- ({status, content}), or an error value (the model then sees the error).
 

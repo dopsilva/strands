@@ -31,6 +31,10 @@ M.models.maritaca = require("./lib/models/maritaca").model
 M.models.openai = require("./lib/models/openai").model
 M.models.scripted = require("./lib/models/scripted").model
 
+M.session = require("./lib/session")
+M.swarm = require("./lib/multiagent/swarm").swarm
+M.graph_builder = require("./lib/multiagent/graph").builder
+
 M.messages = messages
 M.hooks = hooks
 M.conversation = conversation

@@ -1,0 +1,212 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- session — keep an agent's conversation and state across runs
+--
+--   local sm = strands.session.file({session_id = "user-42", storage_dir = "./sessions"})
+--   local agent = strands.agent({session_manager = sm})
+--   -- a later run with the same session_id and agent_id continues where it stopped
+--
+-- File layout (as Strands' FileSessionManager):
+--   <storage_dir>/session_<id>/session.json
+--   <storage_dir>/session_<id>/agents/agent_<agent_id>/agent.json     state, conversation manager
+--   <storage_dir>/session_<id>/agents/agent_<agent_id>/messages/message_<n>.json
+-- strands.session.memory({session_id}) keeps the same data in memory, and
+-- strands.session.repository(repo, {session_id}) stores through any object
+-- with read(key) → value | nil, write(key, value), delete(key), list(prefix).
+-- One session can hold several agents (different agent_id).
+
+local util = require("./util")
+
+local M = {}
+
+local Manager = {}
+
+local function now_iso()
+    return time.now():iso()
+end
+
+-- ---- Repositories ----
+
+-- files under a directory; keys are relative paths ending in .json
+local function file_repo(dir)
+    local r = {}
+    function r.read(key)
+        local p = path.join(dir, key)
+        if not fs.isfile(p) then return nil end
+        local text = fs.read(p)?
+        return json.decode(text)
+    end
+    function r.write(key, value)
+        local p = path.join(dir, key)
+        fs.mkdir(path.dirname(p), {parents = true})?
+        return fs.write(p, json.encode(value), {atomic = true})
+    end
+    function r.delete(key)
+        local p = path.join(dir, key)
+        if fs.exists(p) then return fs.remove(p, {recursive = true}) end
+        return true
+    end
+    function r.list(prefix)
+        local p = path.join(dir, prefix)
+        if not fs.isdir(p) then return [] end
+        return fs.list(p)
+    end
+    return r
+end
+
+local function memory_repo(store)
+    local r = {}
+    function r.read(key) return util.copy(store[key]) end
+    function r.write(key, value)
+        store[key] = util.copy(value)
+        return true
+    end
+    function r.delete(key)
+        local keep = [=]
+        for k, v in store do
+            if k ~= key and not string.starts_with(k, key .. "/") then keep[k] = v end
+        end
+        for k, _ in store do del store[k] end
+        for k, v in keep do store[k] = v end
+        return true
+    end
+    function r.list(prefix)
+        local names = [=]
+        local pre = prefix .. "/"
+        for k, _ in store do
+            if string.starts_with(k, pre) then
+                names[string.split(string.sub(k, len(pre) + 1), "/")[0]] = true
+            end
+        end
+        local out = list.keys(names)
+        sort.sort(out)
+        return out
+    end
+    return r
+end
+
+-- ---- Manager ----
+
+local function new_manager(repo, opts)
+    opts = opts or {}
+    local m = {}
+    m.repo = repo
+    m.session_id = opts.session_id or util.new_id("session_")
+    m.base = `session_${m.session_id}`
+    m.agents = [=] -- agent_id → next message index
+    util.with_methods(m, Manager)
+    local s = repo.read(`${m.base}/session.json`)
+    if is_error(s) then return s end
+    if s == nil then
+        s = {}
+        s.session_id = m.session_id
+        s.session_type = "AGENT"
+        s.created_at = now_iso()
+        s.updated_at = s.created_at
+        repo.write(`${m.base}/session.json`, s)?
+    end
+    return m
+end
+
+function M.file(opts)
+    opts = opts or {}
+    local dir = opts.storage_dir or path.join(fs.tempdir("strands")?, "sessions")
+    if type(opts.storage_dir) == "string" then fs.mkdir(dir, {parents = true})? end
+    return new_manager(file_repo(dir), opts)
+end
+
+local MEMORY = [=]
+
+-- in-memory sessions; shared per process, so two agents (or a re-created
+-- one) with the same session_id see the same data
+function M.memory(opts)
+    return new_manager(memory_repo(MEMORY), opts)
+end
+
+function M.repository(repo, opts)
+    return new_manager(repo, opts)
+end
+
+function Manager.agent_dir(self, agent)
+    return `${self.base}/agents/agent_${agent.agent_id}`
+end
+
+local function message_key(n)
+    return string.format("message_%06d.json", n)
+end
+
+-- restore the agent from the session, or record it there
+function Manager.initialize(self, agent)
+    local dir = self:agent_dir(agent)
+    local saved = self.repo.read(`${dir}/agent.json`)
+    if is_error(saved) then return saved end
+    if saved == nil then
+        self.agents[agent.agent_id] = 0
+        local a = {}
+        a.agent_id = agent.agent_id
+        a.state = agent.state:get()
+        a.conversation_manager_state = agent.conversation_manager:get_state()
+        a.created_at = now_iso()
+        a.updated_at = a.created_at
+        self.repo.write(`${dir}/agent.json`, a)?
+        -- messages given at creation belong to the session too
+        for _, msg in agent.messages do self:append(agent, msg)? end
+        return true
+    end
+    for k, v in saved.state or {} do agent.state:set(k, v) end
+    if saved.conversation_manager_state ~= nil then agent.conversation_manager:restore(saved.conversation_manager_state) end
+    local names = self.repo.list(`${dir}/messages`)
+    if is_error(names) then return names end
+    sort.sort(names)
+    local msgs = []
+    for _, n in names do
+        local rec = self.repo.read(`${dir}/messages/${n}`)
+        if is_error(rec) then return rec end
+        if rec ~= nil then msgs[] = rec.message end
+    end
+    agent.messages = msgs
+    self.agents[agent.agent_id] = len(names)
+    return true
+end
+
+function Manager.append(self, agent, msg)
+    local n = self.agents[agent.agent_id] or 0
+    self.agents[agent.agent_id] = n + 1
+    local rec = {}
+    rec.message_id = n
+    rec.message = msg
+    rec.created_at = now_iso()
+    return self.repo.write(`${self:agent_dir(agent)}/messages/${message_key(n)}`, rec)
+end
+
+-- save state, the conversation manager and the whole history (the manager
+-- may have trimmed or summarized it)
+function Manager.sync(self, agent)
+    local dir = self:agent_dir(agent)
+    local a = self.repo.read(`${dir}/agent.json`) or {}
+    if is_error(a) then return a end
+    a.agent_id = agent.agent_id
+    a.state = agent.state:get()
+    a.conversation_manager_state = agent.conversation_manager:get_state()
+    a.updated_at = now_iso()
+    self.repo.write(`${dir}/agent.json`, a)?
+    self.repo.delete(`${dir}/messages`)?
+    self.agents[agent.agent_id] = 0
+    for _, msg in agent.messages do self:append(agent, msg)? end
+    return true
+end
+
+-- the hooks that keep the session current
+function Manager.register_hooks(self, registry)
+    registry:add_callback("MessageAddedEvent", function(e) self:append(e.agent, e.message) end)
+    registry:add_callback("AfterInvocationEvent", function(e) self:sync(e.agent) end)
+    return true
+end
+
+-- delete the whole session
+function Manager.delete_session(self)
+    return self.repo.delete(self.base)
+end
+
+return M

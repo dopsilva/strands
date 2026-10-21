@@ -1,0 +1,288 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- multiagent/graph — agents wired as a directed graph
+--
+--   local b = strands.graph_builder()
+--   b:add_node(pesquisa, "pesquisa")
+--   b:add_node(analise, "analise")
+--   b:add_node(fatos, "fatos")
+--   b:add_node(relatorio, "relatorio")
+--   b:add_edge("pesquisa", "analise")
+--   b:add_edge("pesquisa", "fatos")
+--   b:add_edge("analise", "relatorio")
+--   b:add_edge("fatos", "relatorio", function(state) return state.results.fatos.text ~= "" end)
+--   b:set_entry_point("pesquisa")            -- default: nodes without incoming edges
+--   local graph = b:build()?
+--   local r = graph:invoke("Pesquise ...")?
+--
+-- A node is an agent, a swarm, another graph, or a function
+-- fn(input, state) → text | result. Nodes whose inputs are ready run in
+-- parallel; a node runs when an edge from a node that just finished leads to
+-- it and its condition (if any) holds. An entry node gets the task; the
+-- others get the task and the outputs of the nodes that lead to them.
+-- Cycles are allowed with set_max_node_executions / reset_on_revisit.
+-- condition(state): state.task, state.results (id → result), state.completed,
+-- state.execution_order.
+-- The result: status, text (the last node's), results, execution_order,
+-- completed_nodes, failed_nodes, total_nodes, accumulated_usage,
+-- execution_time_ms, error.
+
+local util = require("../util")
+local tools_mod = require("../tools")
+local hooks_mod = require("../hooks")
+
+local M = {}
+
+local Builder = {}
+local Graph = {}
+
+function M.builder()
+    local b = {}
+    b.nodes = [=]
+    b.node_order = []
+    b.edges = []
+    b.entry_points = []
+    b.max_node_executions = nil
+    b.execution_timeout_ms = nil
+    b.node_timeout_ms = nil
+    b.reset_on_revisit = false
+    b.hooks = []
+    return util.with_methods(b, Builder)
+end
+
+function Builder.add_node(self, executor, id)
+    if id == nil then id = util.is_record(executor) and executor.name or nil end
+    if type(id) ~= "string" then return error("strands: graph node needs an id") end
+    if self.nodes[id] ~= nil then return error(`strands: graph node '${id}' added twice`) end
+    local ok = type(executor) == "function" or (util.is_record(executor) and (executor.__is_agent or executor.__is_multiagent))
+    if not ok then return error(`strands: graph node '${id}' must be an agent, a swarm, a graph or a function`) end
+    local n = {}
+    n.id = id
+    n.executor = executor
+    if util.is_record(executor) and executor.__is_agent then n.initial_messages = util.copy(executor.messages) end
+    self.nodes[id] = n
+    self.node_order[] = id
+    return self
+end
+
+function Builder.add_edge(self, from, to, condition)
+    if self.nodes[from] == nil then return error(`strands: edge from unknown node '${from}'`) end
+    if self.nodes[to] == nil then return error(`strands: edge to unknown node '${to}'`) end
+    local e = {}
+    e.from = from
+    e.to = to
+    e.condition = condition
+    self.edges[] = e
+    return self
+end
+
+function Builder.set_entry_point(self, id)
+    if self.nodes[id] == nil then return error(`strands: entry point '${id}' is not a node`) end
+    self.entry_points[] = id
+    return self
+end
+
+function Builder.set_max_node_executions(self, n) self.max_node_executions = n; return self end
+function Builder.set_execution_timeout(self, ms) self.execution_timeout_ms = ms; return self end
+function Builder.set_node_timeout(self, ms) self.node_timeout_ms = ms; return self end
+function Builder.reset_on_revisit(self, on) self.reset_on_revisit = on ~= false; return self end
+function Builder.add_hook(self, h) self.hooks[] = h; return self end
+
+function Builder.build(self)
+    if len(self.node_order) == 0 then return error("strands: a graph needs nodes") end
+    local entries = list.copy(self.entry_points)
+    if len(entries) == 0 then
+        local has_in = [=]
+        for _, e in self.edges do has_in[e.to] = true end
+        for _, id in self.node_order do
+            if not has_in[id] then entries[] = id end
+        end
+    end
+    if len(entries) == 0 then return error("strands: a graph with cycles needs set_entry_point") end
+    local g = {}
+    g.__is_multiagent = true
+    g.kind = "graph"
+    g.name = "graph"
+    g.description = ""
+    g.nodes = self.nodes
+    g.node_order = self.node_order
+    g.edges = self.edges
+    g.entry_points = entries
+    g.max_node_executions = self.max_node_executions
+    g.execution_timeout_ms = self.execution_timeout_ms
+    g.node_timeout_ms = self.node_timeout_ms
+    g.reset_on_revisit = self.reset_on_revisit
+    g.hooks = hooks_mod.registry()
+    util.with_methods(g, Graph)
+    for _, h in self.hooks do g.hooks:add_hook(h)? end
+    return g
+end
+
+local function result_text(r)
+    if r == nil then return "" end
+    if type(r) == "string" then return r end
+    if util.is_record(r) and r.text ~= nil then return r.text end
+    return json.encode(r)
+end
+
+-- the input of a node: the task, plus what its predecessors produced
+local function node_input(self, st, id)
+    if list.contains(self.entry_points, id) and st.executions[id] == 0 then return st.task end
+    local parts = [`Original Task: ${st.task}\n`, "Inputs from previous nodes:\n"]
+    for _, e in self.edges do
+        if e.to == id and st.results[e.from] ~= nil then
+            parts[] = `From ${e.from}:`
+            parts[] = `  - ${self.nodes[e.from].executor.name or e.from}: ${result_text(st.results[e.from])}`
+            parts[] = ""
+        end
+    end
+    return string.join(parts, "\n")
+end
+
+local function run_node(self, st, id, invocation_state)
+    local node = self.nodes[id]
+    local ex = node.executor
+    local input = node_input(self, st, id)
+    local bev = self.hooks:invoke("BeforeNodeCallEvent", hooks_mod.event({source = self, node_id = id, invocation_state = invocation_state, cancel = false}))
+    if bev.cancel ~= false and bev.cancel ~= nil then
+        return error(type(bev.cancel) == "string" and bev.cancel or `node '${id}' was cancelled by a hook`)
+    end
+    if util.is_record(ex) and ex.__is_agent and self.reset_on_revisit and st.executions[id] > 0 then
+        ex.messages = util.copy(node.initial_messages)
+    end
+    local function call()
+        if type(ex) == "function" then
+            local failed = nil
+            local out = nil
+            local function inner()
+                defer function()
+                    local e = recover()
+                    if e ~= nil then failed = e end
+                end
+                out = ex(input, st)
+            end
+            inner()
+            if failed ~= nil then return error(is_error(failed) and failed.message or tostring(failed)) end
+            return out
+        end
+        return ex:invoke(input, {state = invocation_state})
+    end
+    local r, timed_out = util.with_timeout(call, self.node_timeout_ms, function()
+        if util.is_record(ex) and ex.__is_agent then ex:cancel() end
+    end)
+    if timed_out then r = error(`node timeout after ${self.node_timeout_ms} ms`) end
+    if not is_error(r) and util.is_record(r) and r.status == "failed" then r = error(r.error or "failed") end
+    self.hooks:invoke("AfterNodeCallEvent", hooks_mod.event({source = self, node_id = id, result = r}))
+    return r
+end
+
+-- graph:invoke(task [, opts]) → result | error
+function Graph.invoke(self, task, opts)
+    opts = opts or {}
+    local t0 = util.now_ms()
+    local invocation_state = opts.state or {}
+    local st = {}
+    st.task = type(task) == "string" and task or json.encode(task)
+    st.results = {}
+    st.completed = []
+    st.execution_order = []
+    st.executions = {}
+    for _, id in self.node_order do st.executions[id] = 0 end
+    local u = {}
+    u.inputTokens = 0
+    u.outputTokens = 0
+    u.totalTokens = 0
+    local result = {}
+    result.status = "completed"
+    result.results = st.results
+    result.execution_order = st.execution_order
+    result.completed_nodes = 0
+    result.failed_nodes = 0
+    result.total_nodes = len(self.node_order)
+    result.accumulated_usage = u
+    result.text = ""
+    self.hooks:invoke("BeforeMultiAgentInvocationEvent", hooks_mod.event({source = self, invocation_state = invocation_state}))
+    local ready = list.copy(self.entry_points)
+    local mu = sync.mutex()
+    while len(ready) > 0 do
+        if self.execution_timeout_ms ~= nil and util.now_ms() - t0 > self.execution_timeout_ms then
+            result.status = "failed"
+            result.error = "execution timeout"
+            break
+        end
+        -- run the batch in parallel
+        local outs = {}
+        local wg = sync.waitgroup()
+        for _, id in ready do
+            wg:add(1)
+            go (function()
+                defer wg:done()
+                local r = run_node(self, st, id, invocation_state)
+                mu:acquire()
+                outs[id] = r
+                mu:release()
+            end)()
+        end
+        wg:wait()
+        local finished = []
+        for _, id in ready do
+            local r = outs[id]
+            st.executions[id] += 1
+            st.execution_order[] = id
+            if is_error(r) then
+                result.failed_nodes += 1
+                result.status = "failed"
+                result.error = `${id}: ${r.message}`
+            else
+                st.results[id] = r
+                if not list.contains(st.completed, id) then
+                    st.completed[] = id
+                    result.completed_nodes += 1
+                end
+                result.text = result_text(r)
+                if util.is_record(r) then
+                    local ru = r.usage or r.accumulated_usage
+                    if ru ~= nil then
+                        u.inputTokens += ru.inputTokens or 0
+                        u.outputTokens += ru.outputTokens or 0
+                        u.totalTokens += ru.totalTokens or 0
+                    end
+                end
+                finished[] = id
+            end
+        end
+        if result.status == "failed" then break end
+        -- the next batch: targets of edges from the nodes that just finished
+        local next_ready = []
+        for _, e in self.edges do
+            if list.contains(finished, e.from) and not list.contains(next_ready, e.to) then
+                local ok = e.condition == nil or e.condition(st) == true
+                local limit_ok = self.max_node_executions == nil or st.executions[e.to] < self.max_node_executions
+                local revisit_ok = st.executions[e.to] == 0 or self.max_node_executions ~= nil
+                if ok and limit_ok and revisit_ok then next_ready[] = e.to end
+            end
+        end
+        ready = next_ready
+    end
+    result.execution_time_ms = util.now_ms() - t0
+    self.hooks:invoke("AfterMultiAgentInvocationEvent", hooks_mod.event({source = self, result = result}))
+    return result
+end
+
+function Graph.as_tool(self, opts)
+    opts = opts or {}
+    return tools_mod.tool({
+        name = opts.name or "graph",
+        description = opts.description or "A workflow of agents",
+        inputs = {input = {type = "string", description = "The task for the workflow"}},
+        fn = function(input, ctx)
+            local r = self:invoke(input.input, {state = ctx.invocation_state})
+            if is_error(r) then return r end
+            if r.status ~= "completed" then return error(r.error) end
+            return r.text
+        end,
+    })
+end
+
+return M

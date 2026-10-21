@@ -261,6 +261,8 @@ local function run_tool(self, use, ctx)
             tctx.tool_use = bev.tool_use
             tctx.agent = self
             tctx.invocation_state = ctx.invocation_state
+            -- ctx.stop(): end the loop after this round of tools
+            tctx.stop = function() ctx.stop = true end
             result = tools_mod.run(bev.selected_tool, bev.tool_use, tctx)
         end
         local aev = self.hooks:invoke("AfterToolCallEvent", hooks_mod.event({
