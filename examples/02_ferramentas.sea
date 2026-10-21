@@ -1,0 +1,58 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- 02_ferramentas.sea — ferramentas próprias e ferramentas prontas
+--
+-- O modelo decide quando chamar cada ferramenta; o agente executa (em
+-- paralelo, quando há várias), devolve os resultados e chama o modelo de
+-- novo até ter a resposta final.
+
+local strands = require("../strands")
+local common = require("./common")
+
+common.title("Ferramentas")
+
+-- uma ferramenta própria: os parâmetros viram JSON Schema e a entrada é validada
+local CEPS = {
+    ["01310-100"] = {logradouro = "Avenida Paulista", cidade = "São Paulo", uf = "SP"},
+    ["20040-020"] = {logradouro = "Avenida Rio Branco", cidade = "Rio de Janeiro", uf = "RJ"},
+}
+
+local consulta_cep = strands.tool({
+    name = "consulta_cep",
+    description = "Consulta o endereço de um CEP brasileiro",
+    inputs = {
+        cep = {type = "string", description = "CEP no formato 00000-000", pattern = "^\\d{5}-\\d{3}$"},
+    },
+    fn = function(input)
+        local e = CEPS[input.cep]
+        if e == nil then return error(`CEP ${input.cep} não encontrado`) end
+        return e -- uma tabela vira um resultado JSON
+    end,
+})?
+
+local agent = strands.agent({
+    model = common.model([
+        {
+            text = "Vou consultar os dois CEPs e fazer a conta.", tools = [
+                {name = "consulta_cep", input = {cep = "01310-100"}},
+                {name = "consulta_cep", input = {cep = "20040-020"}},
+                {name = "calculator", input = {expression = "1764 / 42"}},
+            ],
+        },
+        "O CEP 01310-100 é a Avenida Paulista, em São Paulo (SP), e o 20040-020 é a Avenida Rio Branco, no Rio de Janeiro (RJ). E 1764 / 42 = 42.",
+    ]),
+    system_prompt = "Você é um assistente brasileiro. Use as ferramentas sempre que puder.",
+    tools = [consulta_cep, strands.vended.calculator, strands.vended.current_time],
+})?
+
+local r = agent:invoke("Onde ficam os CEPs 01310-100 e 20040-020? E quanto é 1764 dividido por 42?")?
+
+print("\nUso das ferramentas:")
+for name, m in r.metrics.tool_usage do
+    printf("  %s: %d chamada(s), %d com erro\n", name, m.call_count, m.error_count)
+end
+
+-- uma ferramenta também pode ser chamada diretamente
+local direto = agent.tool.calculator({expression = "sqrt(2) * 10", precision = 4})?
+print("Chamada direta:", strands.messages.result_text(direto))

@@ -1,0 +1,22 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- 01_ola.sea — o agente mais simples, com o texto aparecendo enquanto chega
+--
+--   export MARITACA_API_KEY=...
+--   ~/projects/sea_vm/bin/sea examples/01_ola.sea
+
+local strands = require("../strands")
+local common = require("./common")
+
+common.title("Olá, Sabiá")
+
+local agent = strands.agent({
+    model = common.model(["Olá! Sou um assistente escrito em Sea, rodando sobre o Sabiá da Maritaca. Posso responder perguntas, usar ferramentas e conversar em português."]),
+    system_prompt = "Você é um assistente simpático. Responda em português, em no máximo três frases.",
+})?
+
+-- o callback padrão imprime o texto enquanto o modelo gera
+local r = agent:invoke("Olá! Quem é você e o que sabe fazer?")?
+
+print(`\nparou por: ${r.stop_reason}; tokens: ${r.usage.totalTokens}; latência: ${r.metrics.accumulated_metrics.latencyMs} ms`)

@@ -1,0 +1,62 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- 03_hooks.sea — observar e controlar o agente: log, guarda-corpo e
+-- aprovação humana (interrupção)
+
+local strands = require("../strands")
+local common = require("./common")
+
+common.title("Hooks")
+
+local transferir = strands.tool({
+    name = "transferir",
+    description = "Transfere dinheiro para uma conta",
+    inputs = {conta = "string", valor = {type = "number", minimum = 0}},
+    fn = function(input) return `Transferidos R$ ${input.valor} para ${input.conta}` end,
+})?
+
+-- um provedor de hooks: um objeto com register_hooks
+local Auditoria = {}
+function Auditoria.register_hooks(self, registry)
+    registry:add_callback("BeforeToolCallEvent", function(e)
+        print(`  [auditoria] ${e.tool_use.name} ${json.encode(e.tool_use.input)}`)
+    end)
+    registry:add_callback("AfterInvocationEvent", function(e)
+        if e.result ~= nil then print(`  [auditoria] fim: ${e.result.stop_reason}`) end
+    end)
+end
+
+local agent = strands.agent({
+    model = common.model([
+        {tools = [{name = "transferir", input = {conta = "123-4", valor = 50}}, {name = "transferir", input = {conta = "999-9", valor = 5000}}]},
+        "A transferência de R$ 50 foi feita. A de R$ 5.000 foi recusada na aprovação.",
+    ]),
+    system_prompt = "Você executa transferências bancárias pedidas pelo usuário.",
+    tools = [transferir],
+    hooks = [Auditoria],
+    callback_handler = false,
+})?
+
+-- guarda-corpo: valores acima de 1000 precisam de aprovação humana
+agent:add_hook("BeforeToolCallEvent", function(e)
+    if e.tool_use.name == "transferir" and e.tool_use.input.valor > 1000 then
+        local resposta = e:interrupt("aprovacao", `Aprovar transferência de R$ ${e.tool_use.input.valor} para ${e.tool_use.input.conta}?`)
+        if resposta == nil then return end -- primeira passagem: o agente para e pergunta
+        if resposta ~= "sim" then e.cancel_tool = "Transferência recusada pelo responsável" end
+    end
+end)
+
+local r = agent:invoke("Transfira R$ 50 para a conta 123-4 e R$ 5000 para a 999-9.")?
+while r.stop_reason == "interrupt" do
+    local respostas = []
+    for _, it in r.interrupts do
+        print(`\nAprovação pedida: ${it.reason}`)
+        -- num programa interativo: local resposta = io.read("l")
+        local resposta = "não"
+        print(`Resposta: ${resposta}`)
+        respostas[] = {interruptResponse = {interruptId = it.id, response = resposta}}
+    end
+    r = agent:invoke(respostas)?
+end
+print(`\n${r.text}`)

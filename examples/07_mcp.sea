@@ -1,0 +1,31 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- 07_mcp.sea — ferramentas de um servidor MCP (Model Context Protocol)
+--
+-- Usa o servidor de teste em Sea (tests/fixtures/mcp_server.sea). Com Node
+-- instalado, troque por um servidor real, por exemplo:
+--   strands.mcp.client({command = ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"]})
+
+local strands = require("../strands")
+local common = require("./common")
+
+common.title("MCP")
+
+local sea = fs.readlink("/proc/self/exe")
+-- rodando da raiz do projeto ou de examples/
+local fixture = fs.isfile("tests/fixtures/mcp_server.sea") and "tests/fixtures/mcp_server.sea" or "../tests/fixtures/mcp_server.sea"
+local servidor = strands.mcp.client({command = [sea, fixture]})
+
+local agent = strands.agent({
+    model = common.model([
+        {tools = [{name = "add", input = {a = 19, b = 23}}, {name = "echo", input = {text = "olá do MCP"}}]},
+        "19 + 23 = 42, e o eco devolveu \"olá do MCP\".",
+    ]),
+    tools = [servidor], -- as ferramentas do servidor entram no agente
+    callback_handler = false,
+})?
+print("Ferramentas do servidor:", string.join(agent:tool_names(), ", "))
+print(agent:invoke("Some 19 com 23 e faça um eco de 'olá do MCP'.")?.text)
+
+servidor:stop() -- encerra o processo do servidor

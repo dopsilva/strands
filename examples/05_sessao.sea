@@ -1,0 +1,31 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- 05_sessao.sea — memória entre execuções e controle do contexto
+--
+-- Rode duas vezes: na segunda o agente lembra o que foi dito na primeira.
+-- A sessão fica em ./.strands-exemplo/sessions; apague a pasta para recomeçar.
+
+local strands = require("../strands")
+local common = require("./common")
+
+common.title("Sessão")
+
+local sm = strands.session.file({session_id = "exemplo", storage_dir = ".strands-exemplo/sessions"})?
+local agent = strands.agent({
+    system_prompt = "Você é um assistente que lembra das conversas anteriores. Responda em uma frase.",
+    session_manager = sm,
+    -- até 20 mensagens; resultados grandes de ferramentas são encurtados antes
+    conversation_manager = strands.conversation.sliding_window({window_size = 20}),
+    callback_handler = false,
+})?
+
+local visitas = (agent.state:get("visitas") or 0) + 1
+agent.state:set("visitas", visitas)
+-- (offline, a resposta roteirizada depende da visita)
+agent.model = common.model([visitas == 1 and "Prazer, Daniel! Vou lembrar que você gosta de café coado." or "Você se chama Daniel e gosta de café coado."])
+print(`Execução número ${visitas}; a conversa tem ${len(agent.messages)} mensagens.`)
+
+local pergunta = visitas == 1 and "Meu nome é Daniel e eu gosto de café coado." or "Qual é o meu nome e do que eu gosto?"
+print(`> ${pergunta}`)
+print(agent:invoke(pergunta)?.text)

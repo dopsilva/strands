@@ -1,0 +1,24 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- common — the model for the examples: Maritaca when MARITACA_API_KEY is
+-- set, otherwise a scripted model playing the given answers (so every
+-- example also runs offline).
+
+local strands = require("../strands")
+
+local M = {}
+
+M.online = os.getenv("MARITACA_API_KEY") ~= nil
+
+function M.model(offline_answers, opts)
+    if M.online then return strands.models.maritaca(opts) end
+    return strands.models.scripted(offline_answers or [])
+end
+
+function M.title(s)
+    print(`\n=== ${s} ===`)
+    if not M.online then print("(sem MARITACA_API_KEY: respostas roteirizadas)") end
+end
+
+return M

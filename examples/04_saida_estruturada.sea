@@ -1,0 +1,42 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- 04_saida_estruturada.sea — extrair dados num formato definido
+--
+-- O modelo responde por uma ferramenta structured_output cuja entrada é
+-- validada contra o schema; volta uma tabela pronta para usar.
+
+local strands = require("../strands")
+local common = require("./common")
+
+common.title("Saída estruturada")
+
+local agent = strands.agent({
+    model = common.model([
+        {
+            tool = "structured_output", input = {
+                nome = "Maria Souza", cpf = "123.456.789-00", cidade = "Recife", uf = "PE",
+                itens = [{produto = "notebook", quantidade = 1, preco = 4500.0}, {produto = "mouse", quantidade = 2, preco = 80.0}],
+            },
+        },
+    ]),
+    callback_handler = false,
+})?
+
+local pedido = agent:structured_output({
+    nome = {type = "string", description = "Nome do cliente"},
+    cpf = {type = "string", pattern = "^\\d{3}\\.\\d{3}\\.\\d{3}-\\d{2}$"},
+    cidade = "string",
+    uf = {type = "string", minLength = 2, maxLength = 2},
+    itens = {type = "array", items = {properties = {produto = "string", quantidade = "integer", preco = "number"}}},
+}, [[Olá, sou Maria Souza, CPF 123.456.789-00, moro em Recife (PE).
+Quero 1 notebook de R$ 4.500 e 2 mouses de R$ 80 cada.]]
+)?
+
+print(`Cliente: ${pedido.nome} (${pedido.cpf}) — ${pedido.cidade}/${pedido.uf}`)
+local total = 0
+for _, item in pedido.itens do
+    printf("  %d x %s: R$ %.2f\n", item.quantidade, item.produto, item.preco * item.quantidade)
+    total += item.preco * item.quantidade
+end
+printf("Total: R$ %.2f\n", total)

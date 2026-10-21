@@ -1,0 +1,57 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- 06_multiagente.sea — três formas de agentes trabalharem juntos:
+-- agentes como ferramentas, um swarm e um grafo
+
+local strands = require("../strands")
+local common = require("./common")
+
+local function agente(nome, descricao, prompt, respostas, extra)
+    local o = {}
+    o.name = nome
+    o.description = descricao
+    o.system_prompt = prompt
+    o.model = common.model(respostas)
+    o.callback_handler = false
+    for k, v in extra or {} do o[k] = v end
+    return strands.agent(o)
+end
+
+-- 1. agentes como ferramentas: um orquestrador consulta especialistas
+common.title("Agentes como ferramentas")
+local tributarista = agente("tributarista", "Especialista em impostos no Brasil", "Responda dúvidas sobre impostos brasileiros em duas frases.",
+    ["O MEI paga um valor fixo mensal pelo DAS, que reúne INSS, ISS e/ou ICMS."])?
+local orquestrador = agente("orquestrador", "", "Encaminhe cada pergunta ao especialista certo e resuma a resposta.",
+    [{tool = "tributarista", input = {input = "Como o MEI paga impostos?"}}, "Resumo: o MEI paga um valor fixo por mês, pelo DAS."],
+    {tools = [tributarista:as_tool()]})?
+print(orquestrador:invoke("Como funciona o imposto do MEI?")?.text)
+
+-- 2. swarm: os agentes passam a tarefa uns aos outros
+common.title("Swarm")
+local pesquisador = agente("pesquisador", "Levanta fatos", "Levante fatos e passe para o redator.",
+    [{tool = "handoff_to_agent", input = {agent_name = "redator", message = "Escreva um parágrafo com estes fatos", context = {fatos = ["Brasília foi inaugurada em 1960", "projeto de Lúcio Costa e Oscar Niemeyer"]}}}])?
+local redator = agente("redator", "Escreve textos", "Escreva textos curtos com os fatos recebidos.",
+    ["Inaugurada em 1960, Brasília nasceu do traço de Lúcio Costa e Oscar Niemeyer."])?
+local time_ = strands.swarm({agents = [pesquisador, redator], max_handoffs = 5})?
+local rs = time_:invoke("Escreva um parágrafo sobre a fundação de Brasília")
+print(`${rs.status}: ${string.join(rs.node_history, " → ")}`)
+print(rs.text)
+
+-- 3. grafo: etapas com dependências; as independentes rodam em paralelo
+common.title("Grafo")
+local b = strands.graph_builder()
+b:add_node(agente("coleta", "", "Liste dados.", ["Vendas: jan 100, fev 120, mar 150."])?, "coleta")
+b:add_node(agente("tendencia", "", "Analise a tendência.", ["Crescimento de 50% no trimestre."])?, "tendencia")
+b:add_node(agente("riscos", "", "Aponte riscos.", ["Risco: dependência de poucos clientes."])?, "riscos")
+b:add_node(function(entrada, estado)
+    -- um nó também pode ser uma função
+    return `Relatório final:\n- ${estado.results.tendencia.text}\n- ${estado.results.riscos.text}`
+end, "relatorio")
+b:add_edge("coleta", "tendencia")
+b:add_edge("coleta", "riscos")
+b:add_edge("tendencia", "relatorio")
+local g = b:build()?
+local rg = g:invoke("Analise as vendas do trimestre")
+print(`${rg.status}: ${string.join(rg.execution_order, ", ")}`)
+print(rg.text)

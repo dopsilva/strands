@@ -1,0 +1,35 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- 08_servidor.sea — um agente servido por HTTP e consultado por outro (A2A)
+--
+-- Para deixar o servidor no ar: troque srv.close() por srv.wait() e use
+--   curl -N localhost:9000/stream -d '{"prompt": "oi", "session_id": "ana"}'
+
+local strands = require("../strands")
+local common = require("./common")
+
+common.title("Servidor e A2A")
+
+local srv = strands.server.serve(function(session_id)
+    -- um agente por sessão
+    return strands.agent({
+        model = common.model(["O horário de atendimento é de segunda a sexta, das 9h às 18h."]),
+        system_prompt = "Você é o atendente da Loja Exemplo. Atendimento: seg a sex, 9h-18h.",
+        callback_handler = false,
+    })
+end, {port = 0, name = "atendente", description = "Responde dúvidas sobre a Loja Exemplo"})?
+print(`servidor em http://127.0.0.1:${srv.port}`)
+
+-- outro agente usa o atendente como ferramenta, pelo protocolo A2A
+local atendente = strands.server.a2a_agent(`http://127.0.0.1:${srv.port}`)
+print("cartão A2A:", atendente:card()?.name)
+local cliente = strands.agent({
+    model = common.model([{tool = "atendente", input = {input = "Qual o horário de atendimento?"}}, "A loja atende de segunda a sexta, das 9h às 18h."]),
+    tools = [atendente:as_tool()],
+    callback_handler = false,
+})?
+print(cliente:invoke("Pergunte ao atendente da loja o horário de funcionamento.")?.text)
+
+srv.close()
+srv.wait()

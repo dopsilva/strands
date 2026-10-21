@@ -18,20 +18,26 @@ function M.printing(opts)
     local verbose = not opts or opts.verbose_tool_use ~= false
     local count = 0
     local current = nil
+    local line_start = true
+    local function out(s)
+        if s == "" then return end
+        io.write(s)
+        line_start = string.ends_with(s, "\n")
+    end
     return function(e)
         if e.data ~= nil then
-            io.write(e.data)
+            out(e.data)
         elseif e.reasoningText ~= nil and opts and opts.show_reasoning then
-            io.write(e.reasoningText)
+            out(e.reasoningText)
         elseif e.current_tool_use ~= nil and verbose then
             local id = e.current_tool_use.toolUseId
             if id ~= nil and id ~= current then
                 current = id
                 count += 1
-                io.write(`\nTool #${count}: ${e.current_tool_use.name}\n`)
+                out(`${line_start and "" or "\n"}Tool #${count}: ${e.current_tool_use.name}\n`)
             end
-        elseif e.result ~= nil then
-            io.write("\n")
+        elseif e.result ~= nil and not line_start then
+            out("\n")
         end
     end
 end
