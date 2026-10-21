@@ -1,0 +1,6 @@
+#!/bin/sh
+# strands — the command line (see cli.sea); uses the sea binary on PATH or
+# the sea_vm checkout next to this project
+dir=$(cd "$(dirname "$0")/.." && pwd)
+sea=$(command -v sea || echo "$dir/../sea_vm/bin/sea")
+exec "$sea" "$dir/cli.sea" "$@"

@@ -1,0 +1,97 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- harness — a fully assembled agent with sensible defaults
+--
+--   local agent = strands.harness()?            -- Maritaca sabia-4, tools, session
+--   agent:invoke("Encontre o teste mais lento deste repositório e explique por quê")
+--
+-- After the Strands harness: the model, the tools (files, editor, shell,
+-- HTTP, calculator, time, think), the conversation manager, a session on
+-- disk and a system prompt that describes the environment, all chosen for
+-- you and each one replaceable. Options:
+--   model          default strands.models.maritaca()
+--   workdir        the directory the tools work in (default: the current one)
+--   tools          replace the default tools ([] for none)
+--   extra_tools    add to them (MCP clients, your own tools)
+--   system_prompt  replace the default one; append_system_prompt adds to it
+--   session_id     keep the conversation in <workdir>/.strands/sessions
+--                  (false: no session; default "default")
+--   summarize      true: summarizing conversation manager (default: sliding window of 60)
+--   max_turns      default 60
+--   confirm        consent function for shell and writes (see tools/consent.sea)
+--   callback_handler, hooks, name, ... any other strands.agent option
+
+local util = require("./util")
+local agent_mod = require("./agent")
+local vended = require("./tools/vended")
+local session = require("./session")
+local conversation = require("./conversation")
+local maritaca = require("./models/maritaca")
+
+local M = {}
+
+local function default_prompt(workdir)
+    local now = time.now()
+    return `You are a capable assistant that works on the user's computer through tools.
+
+Environment:
+- working directory: ${workdir}
+- date and time: ${now:iso()}
+- operating system: Linux
+
+How to work:
+- Answer in the user's language.
+- Look before you act: read files and list directories instead of guessing.
+- Use the editor for precise changes to existing files, file_write for new files.
+- Use shell for commands; prefer short, safe commands and explain what you run.
+- Use the calculator for arithmetic and think for hard multi-step problems.
+- When the task is done, say briefly what you did and what is left, if anything.`
+end
+
+function M.harness(opts)
+    opts = opts or {}
+    local workdir = path.abs(opts.workdir or fs.cwd())
+    local tools = opts.tools
+    if tools == nil then
+        tools = [
+            vended.file_read_tool({root = workdir}),
+            vended.file_write_tool({root = workdir, confirm = opts.confirm}),
+            vended.editor_tool({root = workdir, confirm = opts.confirm}),
+            vended.shell_tool({cwd = workdir, confirm = opts.confirm}),
+            vended.http_request,
+            vended.calculator,
+            vended.current_time,
+            vended.think,
+        ]
+    end
+    for _, t in opts.extra_tools or [] do tools[] = t end
+    local prompt = opts.system_prompt or default_prompt(workdir)
+    if opts.append_system_prompt ~= nil then prompt ..= "\n\n" .. opts.append_system_prompt end
+    local sm = nil
+    if opts.session_id ~= false then
+        sm = session.file({session_id = opts.session_id or "default", storage_dir = path.join(workdir, ".strands", "sessions")})?
+    end
+    local cm = opts.conversation_manager
+    if cm == nil then
+        cm = opts.summarize and conversation.summarizing({preserve_recent_messages = 12}) or conversation.sliding_window({window_size = 60})
+    end
+    local o = {}
+    for k, v in opts do o[k] = v end
+    o.model = opts.model or maritaca.model()
+    o.tools = tools
+    o.system_prompt = prompt
+    o.session_manager = sm
+    o.conversation_manager = cm
+    o.max_turns = opts.max_turns or 60
+    o.name = opts.name or "strands-harness"
+    o.workdir = nil
+    o.extra_tools = nil
+    o.append_system_prompt = nil
+    o.session_id = nil
+    o.summarize = nil
+    o.confirm = nil
+    return agent_mod.agent(o)
+end
+
+return M

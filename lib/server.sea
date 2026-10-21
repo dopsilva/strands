@@ -1,0 +1,296 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- server — an agent over HTTP, and the A2A (agent-to-agent) protocol
+--
+--   local srv = strands.server.serve(function(session_id)
+--       return strands.agent({system_prompt = "...", tools = [...]})
+--   end, {port = 9000, name = "atendente", description = "Responde dúvidas"})?
+--   srv.wait()
+--
+-- The factory makes one agent per session (sessions are separate
+-- conversations; requests to one session wait for each other). Endpoints:
+--   GET  /health                           {"status": "ok"}
+--   POST /invoke   {prompt, session_id}    the result as JSON {text, stop_reason, usage, ...}
+--   POST /stream   {prompt, session_id}    Server-Sent Events: {"data": "..."} text deltas,
+--                                          {"tool": name}, then {"result": {...}} or {"error": "..."}
+--   GET  /.well-known/agent.json           the A2A agent card
+--   POST /         A2A JSON-RPC: message/send, message/stream
+-- opts: port (0 = any free port), host, name, description, version,
+-- skills (A2A skills [{id, name, description}]), api_key (then requests
+-- need "Authorization: Bearer <key>"), url (the public URL for the card).
+--
+-- strands.server.a2a_agent(url [, opts]) talks to an A2A agent:
+--   local remoto = strands.server.a2a_agent("http://localhost:9000")
+--   remoto:invoke("oi")?.text        remoto:as_tool()        remoto:card()
+
+local util = require("./util")
+local tools_mod = require("./tools")
+local deps = require("./deps")
+
+local M = {}
+
+local function sse(write, value)
+    return write("data: " .. json.encode(value) .. "\n\n")
+end
+
+local function result_json(r)
+    local o = {}
+    o.text = r.text
+    o.stop_reason = r.stop_reason
+    o.usage = r.usage
+    o.message = r.message
+    o.interrupts = r.interrupts
+    o.structured_output = r.structured_output
+    return o
+end
+
+function M.serve(factory, opts)
+    opts = opts or {}
+    local http = deps.http
+    if type(factory) ~= "function" then
+        local single = factory
+        factory = function(_) return single end
+    end
+    local sessions = [=]
+    local locks = [=]
+    local mu = sync.mutex()
+    local function agent_for(sid)
+        sid = sid or "default"
+        mu:acquire()
+        local a = sessions[sid]
+        local lock = locks[sid]
+        if a == nil then
+            a = factory(sid)
+            if not is_error(a) then
+                sessions[sid] = a
+                lock = sync.mutex()
+                locks[sid] = lock
+            end
+        end
+        mu:release()
+        return a, lock
+    end
+    local function authorized(req)
+        if opts.api_key == nil then return true end
+        return req.headers["authorization"] == "Bearer " .. opts.api_key
+    end
+    local function card(port)
+        local c = {}
+        c.name = opts.name or "strands-agent"
+        c.description = opts.description or "A Strands agent written in Sea"
+        c.url = opts.url or `http://${opts.host or "127.0.0.1"}:${port}/`
+        c.version = opts.version or "0.1.0"
+        c.protocolVersion = "0.3.0"
+        local caps = {}
+        caps.streaming = true
+        c.capabilities = caps
+        c.defaultInputModes = ["text/plain"]
+        c.defaultOutputModes = ["text/plain"]
+        c.skills = opts.skills or []
+        return c
+    end
+    local srv = nil
+    -- run a prompt on a session's agent (one at a time per session)
+    local function run(sid, prompt, callback)
+        local a, lock = agent_for(sid)
+        if is_error(a) then return a end
+        lock:acquire()
+        defer lock:release()
+        return a:invoke(prompt, {callback_handler = callback})
+    end
+    local function a2a_text(params)
+        local parts = []
+        local msg = params and params.message or {}
+        for _, p in msg.parts or [] do
+            if (p.kind == "text" or p.type == "text") and p.text ~= nil then parts[] = p.text end
+        end
+        return string.join(parts, "\n"), msg.contextId
+    end
+    local function a2a_message(text, context_id)
+        local part = {}
+        part.kind = "text"
+        part.text = text
+        local m = {}
+        m.kind = "message"
+        m.role = "agent"
+        m.messageId = util.new_id("msg-")
+        m.parts = [part]
+        if context_id ~= nil then m.contextId = context_id end
+        return m
+    end
+    local function rpc_reply(id, result, err)
+        local r = {}
+        r.jsonrpc = "2.0"
+        r.id = id
+        if err ~= nil then
+            local e = {}
+            e.code = -32000
+            e.message = err
+            r.error = e
+        else
+            r.result = result
+        end
+        return r
+    end
+    local handler = function(req)
+        if req.path == "/health" then return http.json({status = "ok"}) end
+        if req.path == "/.well-known/agent.json" or req.path == "/.well-known/agent-card.json" then
+            return http.json(card(srv.port))
+        end
+        if not authorized(req) then return http.json({error = "unauthorized"}, 401) end
+        if req.method ~= "POST" then return http.json({error = "not found"}, 404) end
+        local body = req:json()
+        if is_error(body) then return http.json({error = "invalid JSON"}, 400) end
+        if req.path == "/invoke" then
+            local r = run(body.session_id, body.prompt, nil)
+            if is_error(r) then return http.json({error = util.message_of(r)}, 500) end
+            return http.json(result_json(r))
+        end
+        if req.path == "/stream" then
+            return {
+                status = 200, headers = {["Content-Type"] = "text/event-stream", ["Cache-Control"] = "no-cache"},
+                stream = function(write)
+                    local r = run(body.session_id, body.prompt, function(e)
+                        if e.data ~= nil then
+                            sse(write, {data = e.data})
+                        elseif e.tool_use ~= nil and e.tool_result ~= nil then
+                            sse(write, {tool = e.tool_use.name, status = e.tool_result.status})
+                        end
+                    end)
+                    if is_error(r) then sse(write, {error = util.message_of(r)}) else sse(write, {result = result_json(r)}) end
+                end,
+            }
+        end
+        if req.path == "/" then
+            local text, ctx_id = a2a_text(body.params)
+            local sid = ctx_id or "a2a"
+            if body.method == "message/send" then
+                local r = run(sid, text, nil)
+                if is_error(r) then return http.json(rpc_reply(body.id, nil, util.message_of(r))) end
+                return http.json(rpc_reply(body.id, a2a_message(r.text, ctx_id)))
+            end
+            if body.method == "message/stream" then
+                return {
+                    status = 200, headers = {["Content-Type"] = "text/event-stream"},
+                    stream = function(write)
+                        local r = run(sid, text, function(e)
+                            if e.data ~= nil then
+                                local ev = {}
+                                ev.kind = "artifact-update"
+                                local part = {}
+                                part.kind = "text"
+                                part.text = e.data
+                                local art = {}
+                                art.parts = [part]
+                                ev.artifact = art
+                                ev.append = true
+                                sse(write, rpc_reply(body.id, ev))
+                            end
+                        end)
+                        if is_error(r) then
+                            sse(write, rpc_reply(body.id, nil, util.message_of(r)))
+                        else
+                            sse(write, rpc_reply(body.id, a2a_message(r.text, ctx_id)))
+                        end
+                    end,
+                }
+            end
+            return http.json(rpc_reply(body.id, nil, `method not supported: ${tostring(body.method)}`))
+        end
+        return http.json({error = "not found"}, 404)
+    end
+    srv = http.listen(opts.port or 9000, handler, {host = opts.host})
+    if is_error(srv) then return srv end
+    return srv
+end
+
+-- ---- A2A client ----
+
+local Remote = {}
+
+function M.a2a_agent(url, opts)
+    opts = opts or {}
+    local r = {}
+    r.url = url
+    while string.ends_with(r.url, "/") do r.url = string.sub(r.url, 1, len(r.url) - 1) end
+    r.headers = opts.headers or {}
+    r.timeout = opts.timeout or 300000
+    r.context_id = opts.context_id or util.new_id("ctx-")
+    r.card_cache = nil
+    r.__is_remote_agent = true
+    return util.with_methods(r, Remote)
+end
+
+function Remote.card(self)
+    if self.card_cache ~= nil then return self.card_cache end
+    local resp = deps.http.get(self.url .. "/.well-known/agent.json", {headers = self.headers, timeout = self.timeout})
+    if not resp.ok then return error(`A2A card: HTTP ${resp.status} ${resp.error or ""}`) end
+    local c = resp:json()?
+    self.card_cache = c
+    return c
+end
+
+-- remote:invoke(text) → {text, message} | error
+function Remote.invoke(self, text)
+    local part = {}
+    part.kind = "text"
+    part.text = text
+    local msg = {}
+    msg.role = "user"
+    msg.parts = [part]
+    msg.messageId = util.new_id("msg-")
+    msg.contextId = self.context_id
+    local params = {}
+    params.message = msg
+    local body = {}
+    body.jsonrpc = "2.0"
+    body.id = util.new_id("")
+    body.method = "message/send"
+    body.params = params
+    local resp = deps.http.post(self.url .. "/", nil, nil, {json = body, headers = self.headers, timeout = self.timeout})
+    if not resp.ok then return error(`A2A: HTTP ${resp.status} ${resp.error or resp.body}`) end
+    local r = resp:json()?
+    if r.error ~= nil then return error(`A2A: ${r.error.message}`) end
+    local texts = []
+    local res = r.result or {}
+    for _, p in res.parts or [] do
+        if p.text ~= nil then texts[] = p.text end
+    end
+    -- a task result keeps its text in artifacts
+    for _, a in res.artifacts or [] do
+        for _, p in a.parts or [] do
+            if p.text ~= nil then texts[] = p.text end
+        end
+    end
+    local out = {}
+    out.text = string.join(texts, "")
+    out.message = res
+    return out
+end
+
+-- remote:as_tool([{name, description}]) → tool
+function Remote.as_tool(self, opts)
+    opts = opts or {}
+    local name = opts.name
+    local desc = opts.description
+    if name == nil or desc == nil then
+        local c = self:card()
+        if not is_error(c) then
+            name = name or string.lower(re.gsub("[^A-Za-z0-9_-]+", c.name or "remote_agent", "_"))
+            desc = desc or c.description
+        end
+    end
+    return tools_mod.tool({
+        name = name or "remote_agent",
+        description = desc or "A remote agent (A2A)",
+        inputs = {input = {type = "string", description = "The request for the remote agent"}},
+        fn = function(input)
+            local r = self:invoke(input.input)
+            if is_error(r) then return r end
+            return r.text
+        end,
+    })
+end
+
+return M

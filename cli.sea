@@ -1,0 +1,194 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- cli — the strands command line
+--
+--   sea cli.sea chat                    conversation with the harness agent
+--   sea cli.sea run "pergunta"          one question, the answer on stdout
+--   sea cli.sea models                  the Maritaca models
+--   sea cli.sea tools                   the harness tools
+--
+-- Flags: --model NAME, --session ID, --no-session, --no-tools, --yes (run
+-- shell commands and writes without asking), --mcp "command" (repeatable:
+-- an MCP server over stdio), --system TEXT, --workdir DIR, --quiet (no tool
+-- lines), --max-turns N. The key comes from MARITACA_API_KEY.
+-- bin/strands is a wrapper: bin/strands chat.
+
+local flags = require("sea/flags")
+local strands = require("./strands")
+local harness = require("./lib/harness")
+local maritaca = require("./lib/models/maritaca")
+
+local model_f = flags.string("model", os.getenv("MARITACA_MODEL") or "sabia-4", "Maritaca model", {alias = "m"})
+local session_f = flags.string("session", "default", "session id (kept in <workdir>/.strands/sessions)", {alias = "s"})
+local no_session_f = flags.bool("no-session", false, "do not keep the conversation")
+local no_tools_f = flags.bool("no-tools", false, "no tools: a plain chat")
+local yes_f = flags.bool("yes", false, "run shell commands and writes without asking", {alias = "y"})
+local mcp_f = flags.list("mcp", "an MCP server command (repeat the flag for more)", {arg = "command"})
+local system_f = flags.string("system", "", "extra instructions for the agent")
+local workdir_f = flags.string("workdir", fs.cwd(), "the directory the tools work in", {alias = "C"})
+local quiet_f = flags.bool("quiet", false, "do not print the tool calls", {alias = "q"})
+local turns_f = flags.int("max-turns", 60, "model calls per question")
+
+flags.set_usage(function()
+    print([[usage: strands <command> [flags] [prompt]
+
+commands:
+  chat              talk with the agent (default)
+  run PROMPT        answer one prompt and exit
+  models            list the Maritaca models
+  tools             list the agent's tools
+
+flags:]]
+    )
+    print(string.join(list.slice(string.splitlines(flags.help()), 3), "\n"))
+end)
+
+local args = flags.parse()
+local command = args[0] or "chat"
+
+if command == "models" then
+    for _, m in maritaca.MODELS do print(m) end
+    print("(append -br-sp to run inside Brazil: sabia-4-br-sp)")
+    os.exit(0)
+end
+
+local mcp_clients = []
+for _, cmd in mcp_f.value do mcp_clients[] = strands.mcp.client({command = cmd}) end
+
+local function stop_mcp()
+    for _, c in mcp_clients do c:stop() end
+end
+
+local function build_agent(callback)
+    local opts = {}
+    opts.model = maritaca.model({model_id = model_f.value})
+    opts.workdir = workdir_f.value
+    opts.session_id = no_session_f.value and false or session_f.value
+    opts.max_turns = turns_f.value
+    opts.callback_handler = callback
+    if no_tools_f.value then opts.tools = [] end
+    opts.extra_tools = mcp_clients
+    if system_f.value ~= "" then opts.append_system_prompt = system_f.value end
+    if yes_f.value then opts.confirm = function(_) return true end end
+    return harness.harness(opts)
+end
+
+if command == "tools" then
+    local a = build_agent(false)
+    if is_error(a) then
+        io.write_err(`strands: ${a.message}\n`)
+        stop_mcp()
+        os.exit(1)
+    end
+    for _, n in a:tool_names() do
+        local t = a.tool_registry:get(n)
+        print(`${n}  —  ${t.description}`)
+    end
+    stop_mcp()
+    os.exit(0)
+end
+
+-- what the terminal shows while the agent works
+local DIM = "\x1b[2m"
+local RESET = "\x1b[0m"
+local function terminal_handler()
+    local current = nil
+    return function(e)
+        if e.data ~= nil then
+            io.write(e.data)
+        elseif e.current_tool_use ~= nil and not quiet_f.value then
+            local id = e.current_tool_use.toolUseId
+            if id ~= current then
+                current = id
+                io.write(`\n${DIM}⚙ ${e.current_tool_use.name}${RESET}\n`)
+            end
+        elseif e.tool_result ~= nil and not quiet_f.value and e.tool_result.status == "error" then
+            local text = strands.messages.result_text(e.tool_result)
+            io.write(`${DIM}  ✗ ${string.sub(text, 1, 200)}${RESET}\n`)
+        elseif e.event_loop_throttled_delay ~= nil then
+            io.write(`\n${DIM}(limite de requisições; nova tentativa em ${e.event_loop_throttled_delay // 1000} s)${RESET}\n`)
+        end
+    end
+end
+
+if os.getenv("MARITACA_API_KEY") == nil then
+    io.write_err("strands: set MARITACA_API_KEY (https://plataforma.maritaca.ai)\n")
+    stop_mcp()
+    os.exit(1)
+end
+
+local agent = build_agent(terminal_handler())
+if is_error(agent) then
+    io.write_err(`strands: ${agent.message}\n`)
+    stop_mcp()
+    os.exit(1)
+end
+
+if command == "run" then
+    local prompt = string.join(list.slice(args, 1), " ")
+    if prompt == "" then
+        local stdin = io.read("a")
+        prompt = stdin or ""
+    end
+    local r = agent:invoke(prompt)
+    io.write("\n")
+    stop_mcp()
+    if is_error(r) then
+        io.write_err(`strands: ${strands.error_message(r)}\n`)
+        os.exit(1)
+    end
+    os.exit(0)
+end
+
+if command ~= "chat" then
+    io.write_err(`strands: unknown command '${command}'\n`)
+    flags.usage(true)
+    stop_mcp()
+    os.exit(2)
+end
+
+-- ---- chat ----
+
+print(`strands ${strands.VERSION} — ${model_f.value} — ${workdir_f.value}`)
+print("Digite sua mensagem. /help para comandos, /exit para sair.")
+local total = 0
+while true do
+    io.write("\n\x1b[1m> \x1b[0m")
+    local line = io.read("l")
+    if line == nil then break end
+    line = string.trim(line)
+    if line == "" then
+        -- nothing
+    elseif line == "/exit" or line == "/quit" then
+        break
+    elseif line == "/help" then
+        print("/reset   esquece a conversa\n/tools   lista as ferramentas\n/usage   tokens usados nesta sessão\n/model NOME   troca o modelo (sabia-4, sabiazinho-4, sabia-4-thinking)\n/exit    sai")
+    elseif line == "/reset" then
+        agent.messages = []
+        if agent.session_manager ~= nil then agent.session_manager:sync(agent) end
+        print("Conversa apagada.")
+    elseif line == "/tools" then
+        print(string.join(agent:tool_names(), ", "))
+    elseif line == "/usage" then
+        print(`${total} tokens`)
+    elseif string.starts_with(line, "/model") then
+        local name = string.trim(string.sub(line, 7))
+        if name == "" then
+            print(agent.model.model_id)
+        else
+            agent.model:update_config({model_id = name})
+            print(`Modelo: ${name}`)
+        end
+    else
+        local r = agent:invoke(line)
+        io.write("\n")
+        if is_error(r) then
+            io.write_err(`\x1b[31merro: ${strands.error_message(r)}\x1b[0m\n`)
+        else
+            total += r.usage.totalTokens
+            if r.stop_reason ~= "end_turn" then print(`${DIM}(parou: ${r.stop_reason})${RESET}`) end
+        end
+    end
+end
+stop_mcp()
