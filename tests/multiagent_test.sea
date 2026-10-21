@@ -1,0 +1,94 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+local t = require("sea/test")
+local strands = require("../strands")
+
+local function ag(name, answers, opts)
+    local o = {}
+    o.name = name
+    o.description = `o ${name}`
+    o.callback_handler = false
+    o.model = strands.models.scripted(answers)
+    for k, v in opts or {} do o[k] = v end
+    return t.no_error(strands.agent(o))
+end
+
+t.describe("swarm", function()
+    t.it("hands the task over with context and ends at an answer", function()
+        local prompts = []
+        local a = ag("pesquisador", [{tool = "handoff_to_agent", input = {agent_name = "redator", message = "escreva", context = {fonte = "IBGE"}}}])
+        local b = ag("redator", [
+            function(req)
+                prompts[] = req.messages[0].content[0].text
+                return "Artigo pronto"
+            end,
+        ])
+        local sw = t.no_error(strands.swarm({agents = [a, b]}))
+        local r = sw:invoke("Escreva sobre o Brasil")
+        t.eq(r.status, "completed")
+        t.eq(r.text, "Artigo pronto")
+        t.eq(r.node_history, ["pesquisador", "redator"])
+        t.eq(r.accumulated_usage.totalTokens, 30)
+        t.contains(prompts[0], "Handoff Message: escreva")
+        t.contains(prompts[0], "pesquisador.fonte: \"IBGE\"")
+        t.contains(prompts[0], "Previous agents who worked on this: pesquisador")
+        t.eq(a:tool_names(), []) -- the handoff tool is removed afterwards
+    end)
+
+    t.it("fails at max_handoffs and on unknown agents", function()
+        local ping = []
+        local pong = []
+        for _ = 1, 10 do
+            ping[] = {tool = "handoff_to_agent", input = {agent_name = "b", message = "vai"}}
+            pong[] = {tool = "handoff_to_agent", input = {agent_name = "a", message = "volta"}}
+        end
+        local sw = t.no_error(strands.swarm({agents = [ag("a", ping), ag("b", pong)], max_handoffs = 3}))
+        local r = sw:invoke("x")
+        t.eq(r.status, "failed")
+        t.contains(r.error, "max_handoffs")
+        t.is_error(strands.swarm({agents = [ag("a", [])], entry_point = "z"}), "entry point")
+    end)
+end)
+
+t.describe("graph", function()
+    t.it("runs ready nodes, passes outputs along and follows conditions", function()
+        local b = strands.graph_builder()
+        b:add_node(ag("a", ["saída A"]), "a")
+        b:add_node(ag("b", ["saída B"]), "b")
+        b:add_node(function(input, st) return "C recebeu: " .. input end, "c")
+        b:add_node(ag("d", ["não deveria"]), "d")
+        b:add_edge("a", "b")
+        b:add_edge("a", "c")
+        b:add_edge("c", "d", function(st) return string.contains(st.results.c, "nada") end)
+        local g = t.no_error(b:build())
+        local r = g:invoke("tarefa")
+        t.eq(r.status, "completed")
+        t.eq(r.execution_order[0], "a")
+        t.eq(len(r.execution_order), 3)
+        t.eq(r.completed_nodes, 3)
+        t.contains(r.results.c, "Original Task: tarefa")
+        t.contains(r.results.c, "From a:")
+        t.contains(r.results.c, "saída A")
+        t.is_nil(r.results.d)
+    end)
+
+    t.it("reports a failing node", function()
+        local b = strands.graph_builder()
+        b:add_node(function() return error("quebrou") end, "x")
+        local r = t.no_error(b:build()):invoke("t")
+        t.eq(r.status, "failed")
+        t.contains(r.error, "quebrou")
+    end)
+
+    t.it("nests a swarm as a node and a graph as a tool", function()
+        local sw = t.no_error(strands.swarm({agents = [ag("solo", ["do swarm", "do swarm"])]}))
+        local b = strands.graph_builder()
+        b:add_node(sw, "time")
+        local g = t.no_error(b:build())
+        t.eq(g:invoke("t").text, "do swarm")
+        local boss = ag("chefe", [{tool = "fluxo", input = {input = "rode"}}, "ok"], {tools = [g:as_tool({name = "fluxo"})]})
+        t.no_error(boss:invoke("x"))
+        t.eq(strands.messages.result_text(strands.messages.tool_results(boss.messages[2])[0]), "do swarm")
+    end)
+end)

@@ -1,0 +1,93 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+local t = require("sea/test")
+local strands = require("../strands")
+local msgs = strands.messages
+
+local function chat(n)
+    local out = []
+    for i = 1, n do
+        out[] = msgs.user(`p${i}`)
+        out[] = msgs.assistant(`r${i}`)
+    end
+    return out
+end
+
+local function fake_agent(messages)
+    local a = {}
+    a.messages = messages
+    return a
+end
+
+t.describe("sliding window", function()
+    t.it("keeps the last window_size messages", function()
+        local cm = strands.conversation.sliding_window({window_size = 4})
+        local a = fake_agent(chat(5))
+        cm:apply_management(a)
+        t.eq(len(a.messages), 4)
+        t.eq(msgs.text(a.messages[0]), "p4")
+        t.eq(cm.removed_message_count, 6)
+    end)
+
+    t.it("never starts the history on tool results", function()
+        local m = [
+            msgs.user("pergunta"),
+            msgs.assistant([msgs.tool_use_block("t1", "x", {})]),
+            msgs.user([msgs.tool_result_block(msgs.tool_result("t1", "success", "ok"))]),
+            msgs.assistant("resposta"),
+            msgs.user("mais"),
+        ]
+        local cm = strands.conversation.sliding_window({window_size = 3})
+        local a = fake_agent(m)
+        cm:apply_management(a)
+        t.eq(msgs.text(a.messages[0]), "resposta")
+    end)
+
+    t.it("truncates large tool results first on overflow", function()
+        local big = string.rep("x", 5000)
+        local m = [
+            msgs.user("q"),
+            msgs.assistant([msgs.tool_use_block("t1", "x", {})]),
+            msgs.user([msgs.tool_result_block(msgs.tool_result("t1", "success", big))]),
+            msgs.assistant("r"),
+        ]
+        local cm = strands.conversation.sliding_window({window_size = 10})
+        local a = fake_agent(m)
+        t.no_error(cm:reduce_context(a, error("[context_window_overflow] x")))
+        t.eq(len(a.messages), 4)
+        local text = msgs.result_text(msgs.tool_results(a.messages[2])[0])
+        t.lt(len(text), 2100)
+        t.contains(text, "<truncated")
+    end)
+end)
+
+t.describe("summarizing", function()
+    t.it("replaces the oldest messages with a summary", function()
+        local model = strands.models.scripted(["- o usuário perguntou p1 a p4"])
+        local a = t.no_error(strands.agent({model = model, callback_handler = false, messages = chat(10)}))
+        local cm = t.no_error(strands.conversation.summarizing({summary_ratio = 0.4, preserve_recent_messages = 4}))
+        t.no_error(cm:reduce_context(a, nil))
+        t.eq(cm.removed_message_count, 8)
+        t.contains(msgs.text(a.messages[0]), "Summary of the earlier conversation")
+        t.contains(msgs.text(a.messages[0]), "p1 a p4")
+        t.eq(a.messages[1].role, "assistant")
+        t.contains(model.requests[0].messages[0].content[0].text, "user: p1")
+    end)
+
+    t.it("refuses when too few messages remain", function()
+        local a = t.no_error(strands.agent({model = strands.models.scripted([]), callback_handler = false, messages = chat(2)}))
+        local cm = t.no_error(strands.conversation.summarizing({preserve_recent_messages = 10}))
+        t.is_error(cm:reduce_context(a, nil), "too few messages")
+    end)
+end)
+
+t.describe("messages", function()
+    t.it("repair adds results for tool calls left without them", function()
+        local m = [msgs.user("q"), msgs.assistant([msgs.tool_use_block("t1", "x", {}), msgs.tool_use_block("t2", "y", {})])]
+        msgs.repair(m)
+        t.eq(len(m), 3)
+        t.eq(len(msgs.tool_results(m[2])), 2)
+        t.eq(msgs.tool_results(m[2])[0].status, "error")
+    end)
+end)

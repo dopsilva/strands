@@ -22,7 +22,6 @@
 --   confirm        consent function for shell and writes (see tools/consent.sea)
 --   callback_handler, hooks, name, ... any other strands.agent option
 
-local util = require("./util")
 local agent_mod = require("./agent")
 local vended = require("./tools/vended")
 local session = require("./session")

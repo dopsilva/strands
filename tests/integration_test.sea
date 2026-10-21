@@ -1,0 +1,118 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- sessions, MCP, the HTTP/A2A server and the harness
+
+local t = require("sea/test")
+local strands = require("../strands")
+local http = require("../../sea_vm/libs/http/http")
+
+-- the running sea binary, and this directory (tests run from the project
+-- root or from tests/)
+local SEA = fs.readlink("/proc/self/exe")
+local HERE = fs.isdir("tests/fixtures") and path.abs("tests") or path.abs(".")
+
+t.describe("sessions", function()
+    t.it("file sessions restore messages, state and the conversation manager", function()
+        local dir = fs.tempdir("strands-session")
+        local function make(answers)
+            local sm = t.no_error(strands.session.file({session_id = "s1", storage_dir = dir}))
+            return t.no_error(strands.agent({model = strands.models.scripted(answers), callback_handler = false, session_manager = sm}))
+        end
+        local a = make(["primeira resposta"])
+        a.state:set("cliente", "Ana")
+        t.no_error(a:invoke("oi"))
+        local b = make(["segunda resposta"])
+        t.eq(len(b.messages), 2)
+        t.eq(strands.messages.text(b.messages[1]), "primeira resposta")
+        t.eq(b.state:get("cliente"), "Ana")
+        t.no_error(b:invoke("de novo"))
+        t.eq(len(fs.list(path.join(dir, "session_s1/agents/agent_default/messages"))), 4)
+        t.ok(fs.isfile(path.join(dir, "session_s1/session.json")))
+    end)
+
+    t.it("memory sessions keep agents apart by agent_id", function()
+        local sm = t.no_error(strands.session.memory({session_id = "mem1"}))
+        local a = t.no_error(strands.agent({agent_id = "a", model = strands.models.scripted(["A"]), callback_handler = false, session_manager = sm}))
+        local b = t.no_error(strands.agent({agent_id = "b", model = strands.models.scripted(["B"]), callback_handler = false, session_manager = sm}))
+        t.no_error(a:invoke("x"))
+        t.no_error(b:invoke("y"))
+        local a2 = t.no_error(strands.agent({
+            agent_id = "a", model = strands.models.scripted([]), callback_handler = false,
+            session_manager = t.no_error(strands.session.memory({session_id = "mem1"})),
+        }))
+        t.eq(strands.messages.text(a2.messages[1]), "A")
+    end)
+end)
+
+t.describe("MCP", function()
+    t.it("lists a stdio server's tools (paginated) and calls them", function()
+        local c = strands.mcp.client({command = [SEA, path.join(HERE, "fixtures/mcp_server.sea")], prefix = "srv_"})
+        local a = t.no_error(strands.agent({
+            tools = [c], callback_handler = false, model = strands.models.scripted([
+                {tools = [{name = "srv_echo", input = {text = "oi"}}, {name = "srv_add", input = {a = 2, b = 3}}]}, "ok",
+            ]),
+        }))
+        t.eq(a:tool_names(), ["srv_echo", "srv_add"])
+        t.no_error(a:invoke("x"))
+        local rs = strands.messages.tool_results(a.messages[2])
+        t.eq(strands.messages.result_text(rs[0]), "echo: oi")
+        t.eq(strands.messages.result_text(rs[1]), "5")
+        t.eq(t.no_error(c:list_prompts())[0].name, "greet")
+        t.eq(t.no_error(c:read_resource("mem://note")).contents[0].text, "a note")
+        t.is_error(c:request("nope/nope", {}), "unknown method")
+        c:stop()
+    end)
+end)
+
+t.describe("server and A2A", function()
+    t.it("serves JSON, SSE and A2A, one agent per session", function()
+        local made = 0
+        local srv = t.no_error(strands.server.serve(function(sid)
+            made += 1
+            return strands.agent({
+                callback_handler = false, model = strands.models.scripted([
+                    function(req) return `${sid}: ${len(req.messages)} mensagem(ns)` end,
+                    function(req) return `${sid}: ${len(req.messages)} mensagem(ns)` end,
+                ]),
+            })
+        end, {port = 0, name = "teste", description = "agente de teste"}))
+        local base = `http://127.0.0.1:${srv.port}`
+        t.eq(http.get(base .. "/health"):json().status, "ok")
+        t.eq(http.post(base .. "/invoke", nil, nil, {json = {prompt = "oi", session_id = "s"}}):json().text, "s: 1 mensagem(ns)")
+        t.eq(http.post(base .. "/invoke", nil, nil, {json = {prompt = "oi", session_id = "s"}}):json().text, "s: 3 mensagem(ns)")
+        local events = ""
+        http.post(base .. "/stream", nil, nil, {json = {prompt = "x", session_id = "z"}, on_data = function(p) events ..= p end})
+        t.contains(events, "data: {\"data\":")
+        t.contains(events, "\"result\":")
+        local remote = strands.server.a2a_agent(base, {context_id = "ctx1"})
+        t.eq(t.no_error(remote:card()).name, "teste")
+        t.eq(t.no_error(remote:invoke("pelo a2a")).text, "ctx1: 1 mensagem(ns)")
+        t.eq(made, 3)
+        srv.close()
+        srv.wait()
+    end)
+
+    t.it("asks for the API key when set", function()
+        local srv = t.no_error(strands.server.serve(strands.agent({callback_handler = false, model = strands.models.scripted(["x"])}), {port = 0, api_key = "segredo"}))
+        local base = `http://127.0.0.1:${srv.port}`
+        t.eq(http.post(base .. "/invoke", nil, nil, {json = {prompt = "oi"}}).status, 401)
+        t.eq(http.post(base .. "/invoke", nil, nil, {json = {prompt = "oi"}, headers = {Authorization = "Bearer segredo"}}).status, 200)
+        srv.close()
+        srv.wait()
+    end)
+end)
+
+t.describe("harness", function()
+    t.it("assembles an agent with tools, a session and a prompt about the workdir", function()
+        local dir = fs.tempdir("strands-harness")
+        local a = t.no_error(strands.harness({workdir = dir, model = strands.models.scripted(["pronto"]), callback_handler = false}))
+        t.contains(a.system_prompt, dir)
+        t.contains(a:tool_names(), "editor")
+        t.contains(a:tool_names(), "shell")
+        t.no_error(a:invoke("oi"))
+        t.ok(fs.isdir(path.join(dir, ".strands/sessions/session_default")))
+        local plain = t.no_error(strands.harness({workdir = dir, tools = [], session_id = false, model = strands.models.scripted([]), callback_handler = false}))
+        t.eq(plain:tool_names(), [])
+    end)
+end)

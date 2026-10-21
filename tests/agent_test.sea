@@ -1,0 +1,339 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+local t = require("sea/test")
+local strands = require("../strands")
+
+local scripted = strands.models.scripted
+
+local add = strands.tool({
+    name = "add",
+    description = "Adds two numbers",
+    inputs = {a = "number", b = "number"},
+    fn = function(input) return input.a + input.b end,
+})
+
+local function agent(model, opts)
+    local o = {}
+    o.model = model
+    o.callback_handler = false
+    o.tools = [add]
+    o.retry = {max_attempts = 3, initial_delay_ms = 1, max_delay_ms = 5}
+    for k, v in opts or {} do o[k] = v end
+    return t.no_error(strands.agent(o))
+end
+
+t.describe("agent loop", function()
+    t.it("answers without tools", function()
+        local a = agent(scripted(["Olá!"]))
+        local r = t.no_error(a:invoke("oi"))
+        t.eq(r.stop_reason, "end_turn")
+        t.eq(r.text, "Olá!")
+        t.eq(len(a.messages), 2)
+        t.eq(r.metrics.total_cycles, 1)
+        t.eq(r.usage.totalTokens, 15)
+    end)
+
+    t.it("runs tools and calls the model again with their results", function()
+        local m = scripted([
+            {text = "Somando.", tools = [{name = "add", input = {a = 1, b = 2}}, {name = "add", input = {a = 3, b = 4}}]},
+            "3 e 7",
+        ])
+        local a = agent(m)
+        local r = t.no_error(a:invoke("some"))
+        t.eq(r.text, "3 e 7")
+        t.eq(len(a.messages), 4)
+        local results = strands.messages.tool_results(a.messages[2])
+        t.eq(len(results), 2)
+        t.eq(results[0].content[0].json, 3)
+        t.eq(results[1].content[0].json, 7)
+        -- the second request carried the results
+        t.eq(len(m.requests[1].messages), 3)
+        t.eq(r.metrics.tool_usage.add.call_count, 2)
+    end)
+
+    t.it("keeps the call order with sequential and concurrent executors", function()
+        local slow = strands.tool({
+            name = "slow", inputs = {ms = "integer"},
+            fn = function(i)
+                time.sleep(i.ms * time.Millisecond)
+                return i.ms
+            end,
+        })
+        for _, ex in ["sequential", "concurrent"] do
+            local a = agent(scripted([{tools = [{name = "slow", input = {ms = 30}}, {name = "slow", input = {ms = 1}}]}, "ok"]),
+                {tools = [slow], tool_executor = ex})
+            t.no_error(a:invoke("x"))
+            local rs = strands.messages.tool_results(a.messages[2])
+            t.eq(rs[0].content[0].json, 30)
+            t.eq(rs[1].content[0].json, 1)
+        end
+    end)
+
+    t.it("reports unknown tools, bad input and failing tools back to the model", function()
+        local boom = strands.tool({name = "boom", fn = function(_) panic("explodiu") end})
+        local errv = strands.tool({name = "errv", fn = function(_) return error("deu errado") end})
+        local a = agent(scripted([
+            {tools = [{name = "nope", input = {}}, {name = "add", input = {a = "x", b = 1}}, {name = "boom", input = {}}, {name = "errv", input = {}}]},
+            "entendi",
+        ]), {tools = [add, boom, errv]})
+        t.no_error(a:invoke("x"))
+        local rs = strands.messages.tool_results(a.messages[2])
+        for _, r in rs do t.eq(r.status, "error") end
+        t.contains(strands.messages.result_text(rs[0]), "not found")
+        t.contains(strands.messages.result_text(rs[1]), "input.a must be a number")
+        t.contains(strands.messages.result_text(rs[2]), "explodiu")
+        t.contains(strands.messages.result_text(rs[3]), "deu errado")
+    end)
+
+    t.it("accepts content blocks and messages as the prompt", function()
+        local a = agent(scripted(["a", "b"]))
+        t.no_error(a:invoke([strands.messages.text_block("parte 1"), strands.messages.text_block("parte 2")]))
+        t.eq(len(a.messages[0].content), 2)
+        t.no_error(a:invoke([strands.messages.user("u1"), strands.messages.assistant("a1"), strands.messages.user("u2")]))
+        t.eq(len(a.messages), 6)
+    end)
+
+    t.it("refuses a second invocation while one runs", function()
+        local a = nil
+        local inner = nil
+        local tool = strands.tool({
+            name = "reenter",
+            fn = function(_, ctx)
+                inner = ctx.agent:invoke("de novo")
+                return "ok"
+            end,
+        })
+        a = agent(scripted([{tool = "reenter", input = {}}, "fim"]), {tools = [tool]})
+        t.no_error(a:invoke("x"))
+        t.is_error(inner, "already running")
+    end)
+end)
+
+t.describe("limits, cancel, retries", function()
+    t.it("stops at max_turns", function()
+        local loop = []
+        for _ = 1, 10 do loop[] = {tool = "add", input = {a = 1, b = 1}} end
+        local a = agent(scripted(loop), {max_turns = 3})
+        local r = t.no_error(a:invoke("x"))
+        t.eq(r.stop_reason, "limit_turns")
+        t.eq(r.metrics.total_cycles, 3)
+    end)
+
+    t.it("stops at max_total_tokens", function()
+        local a = agent(scripted([{tool = "add", input = {a = 1, b = 1}}, {tool = "add", input = {a = 1, b = 1}}, "x"]), {max_total_tokens = 20})
+        local r = t.no_error(a:invoke("x"))
+        t.eq(r.stop_reason, "limit_total_tokens")
+    end)
+
+    t.it("cancels from a callback and repairs the conversation", function()
+        local a = nil
+        a = agent(scripted([{tools = [{name = "add", input = {a = 1, b = 1}}, {name = "add", input = {a = 2, b = 2}}]}, "nunca"]), {
+            tool_executor = "sequential",
+            callback_handler = function(e)
+                if e.tool_result ~= nil then a:cancel() end
+            end,
+        })
+        local r = t.no_error(a:invoke("x"))
+        t.eq(r.stop_reason, "cancelled")
+        -- the second call never ran but got an error result
+        local rs = strands.messages.tool_results(a.messages[2])
+        t.eq(len(rs), 2)
+        t.eq(rs[1].status, "error")
+    end)
+
+    t.it("retries throttled calls and gives up after max_attempts", function()
+        local a = agent(scripted([{error = "[throttled] HTTP 429"}, {error = "[throttled] HTTP 429"}, "enfim"]))
+        local delays = []
+        local r = t.no_error(a:invoke("x", {
+            callback_handler = function(e)
+                if e.event_loop_throttled_delay ~= nil then delays[] = e.event_loop_throttled_delay end
+            end,
+        }))
+        t.eq(r.text, "enfim")
+        t.eq(delays, [1, 2])
+        local b = agent(scripted([{error = "[throttled] a"}, {error = "[throttled] b"}, {error = "[throttled] c"}, "tarde"]))
+        t.is_error(b:invoke("x"), "[throttled] c")
+    end)
+
+    t.it("reduces the context on overflow and tries again", function()
+        local msgs = []
+        for i = 1, 6 do
+            msgs[] = strands.messages.user(`pergunta ${i}`)
+            msgs[] = strands.messages.assistant(`resposta ${i}`)
+        end
+        local a = agent(scripted([{error = "[context_window_overflow] too long"}, "coube"]), {messages = msgs})
+        local r = t.no_error(a:invoke("nova"))
+        t.eq(r.text, "coube")
+        t.lt(len(a.messages), 14)
+        t.eq(a.messages[0].role, "user")
+    end)
+
+    t.it("fails on max_tokens and on other model errors", function()
+        t.is_error(agent(scripted([{text = "cortad", stop_reason = "max_tokens"}])):invoke("x"), "[max_tokens]")
+        local e = agent(scripted([{error = "[model] HTTP 500"}])):invoke("x")
+        t.eq(strands.error_kind(e), "model")
+        t.eq(strands.error_message(e), "HTTP 500")
+    end)
+end)
+
+t.describe("hooks", function()
+    t.it("fire in order around invocation, model and tool calls", function()
+        local seen = []
+        local a = agent(scripted([{tool = "add", input = {a = 1, b = 1}}, "ok"]))
+        for _, ev in strands.hooks.EVENTS do
+            if not string.contains(ev, "Node") and not string.contains(ev, "MultiAgent") and ev ~= "AgentInitializedEvent" then
+                a:add_hook(ev, function(e) seen[] = string.replace(e.event_name, "Event", "") end)
+            end
+        end
+        t.no_error(a:invoke("x"))
+        t.eq(seen, [
+            "BeforeInvocation", "MessageAdded", "BeforeModelCall", "AfterModelCall", "MessageAdded",
+            "BeforeToolCall", "AfterToolCall", "MessageAdded", "BeforeModelCall", "AfterModelCall",
+            "MessageAdded", "AfterInvocation",
+        ])
+    end)
+
+    t.it("change tool input, cancel tools and rewrite results", function()
+        local a = agent(scripted([{tools = [{name = "add", input = {a = 1, b = 1}}, {name = "add", input = {a = 5, b = 5}}]}, "ok"]))
+        a:add_hook("BeforeToolCallEvent", function(e)
+            if e.tool_use.input.a == 1 then e.tool_use.input.a = 100 end
+            if e.tool_use.input.a == 5 then e.cancel_tool = "proibido" end
+        end)
+        a:add_hook("AfterToolCallEvent", function(e)
+            if e.result.status == "success" then e.result = strands.messages.tool_result(e.tool_use.toolUseId, "success", "cem e um") end
+        end)
+        t.no_error(a:invoke("x"))
+        local rs = strands.messages.tool_results(a.messages[2])
+        t.eq(strands.messages.result_text(rs[0]), "cem e um")
+        t.eq(rs[1].status, "error")
+        t.eq(strands.messages.result_text(rs[1]), "proibido")
+    end)
+
+    t.it("retry a model call from AfterModelCallEvent", function()
+        local a = agent(scripted(["ruim", "bom"]))
+        local tries = 0
+        a:add_hook("AfterModelCallEvent", function(e)
+            tries += 1
+            if e.stop_response ~= nil and strands.messages.text(e.stop_response.message) == "ruim" then e.retry = true end
+        end)
+        t.eq(t.no_error(a:invoke("x")).text, "bom")
+        t.eq(tries, 2)
+    end)
+
+    t.it("come from providers with register_hooks", function()
+        local log = []
+        local provider = {}
+        function provider.register_hooks(self, reg)
+            reg:add_callback("BeforeInvocationEvent", function(e) log[] = "start" end)
+            reg:add_callback("AfterInvocationEvent", function(e) log[] = e.result.text end)
+        end
+        local a = agent(scripted(["fim"]), {hooks = [provider]})
+        t.no_error(a:invoke("x"))
+        t.eq(log, ["start", "fim"])
+        t.is_error(a:add_hook("NoSuchEvent", function(e) end), "unknown hook event")
+    end)
+end)
+
+t.describe("interrupts", function()
+    t.it("stop for a human answer and resume with it", function()
+        local a = agent(scripted([
+            {tools = [{name = "add", input = {a = 1, b = 2}, id = "t1"}, {name = "add", input = {a = 10, b = 20}, id = "t2"}]},
+            "feito",
+        ]))
+        a:add_hook("BeforeToolCallEvent", function(e)
+            if e.tool_use.input.a == 10 then
+                local answer = e:interrupt("aprovar", "Somar números grandes?")
+                if answer == nil then return end
+                if answer ~= "sim" then e.cancel_tool = "o usuário recusou" end
+            end
+        end)
+        local r = t.no_error(a:invoke("some"))
+        t.eq(r.stop_reason, "interrupt")
+        t.eq(len(r.interrupts), 1)
+        t.eq(r.interrupts[0].name, "aprovar")
+        t.eq(r.interrupts[0].reason, "Somar números grandes?")
+        t.is_error(a:invoke("outra coisa"), "waiting for interrupt responses")
+        local r2 = t.no_error(a:invoke([{interruptResponse = {interruptId = r.interrupts[0].id, response = "sim"}}]))
+        t.eq(r2.text, "feito")
+        local rs = strands.messages.tool_results(a.messages[2])
+        t.eq(len(rs), 2)
+        t.eq(rs[0].content[0].json, 3)
+        t.eq(rs[1].content[0].json, 30)
+    end)
+end)
+
+t.describe("structured output", function()
+    t.it("comes from the structured_output tool", function()
+        local a = agent(scripted([{tool = "structured_output", input = {nome = "Ana", idade = 30}}]))
+        local v = t.no_error(a:structured_output({nome = "string", idade = "integer"}, "Ana tem 30 anos"))
+        t.eq(v, {nome = "Ana", idade = 30})
+        -- the tool is gone afterwards
+        t.eq(a:tool_names(), ["add"])
+    end)
+
+    t.it("is requested again when the model answers in text, and validated", function()
+        local m = scripted([
+            "A pessoa é Ana.",
+            {tool = "structured_output", input = {nome = "Ana"}},
+            {tool = "structured_output", input = {nome = "Ana", idade = 30}},
+        ])
+        local a = agent(m)
+        local schema = {type = "object", properties = {nome = {type = "string"}, idade = {type = "integer"}}, required = ["nome", "idade"]}
+        local r = t.no_error(a:invoke("quem?", {structured_output = schema}))
+        t.eq(r.structured_output.idade, 30)
+        t.eq(m.requests[1].tool_choice.name, "structured_output")
+    end)
+end)
+
+t.describe("direct tool calls, agents as tools, streaming, state", function()
+    t.it("agent.tool.x() runs a tool and records it", function()
+        local a = agent(scripted([]))
+        local r = t.no_error(a.tool.add({a = 2, b = 3}))
+        t.eq(r.content[0].json, 5)
+        t.eq(len(a.messages), 4)
+        t.eq(a.messages[1].content[0].toolUse.name, "add")
+        t.no_error(a.tool.add({a = 1, b = 1}, {record = false}))
+        t.eq(len(a.messages), 4)
+    end)
+
+    t.it("as_tool lets one agent call another", function()
+        local helper = agent(scripted(["sou o ajudante"]), {name = "ajudante", description = "ajuda"})
+        local boss = agent(scripted([{tool = "ajudante", input = {input = "ajude"}}, "pronto"]), {tools = [helper:as_tool()]})
+        t.no_error(boss:invoke("x"))
+        t.eq(strands.messages.result_text(strands.messages.tool_results(boss.messages[2])[0]), "sou o ajudante")
+        t.eq(len(helper.messages), 0) -- a fresh copy answered
+    end)
+
+    t.it("stream() gives the events on a channel", function()
+        local a = agent(scripted(["um texto longo o bastante"]))
+        local text = ""
+        local last = nil
+        for e in a:stream("x") do
+            if e.data ~= nil then text ..= e.data end
+            last = e
+        end
+        t.eq(text, "um texto longo o bastante")
+        t.eq(last.result.stop_reason, "end_turn")
+    end)
+
+    t.it("agent.state keeps JSON values", function()
+        local a = agent(scripted([]), {state = {n = 1}})
+        t.eq(a.state:get("n"), 1)
+        t.no_error(a.state:set("u", {nome = "Ana"}))
+        local u = a.state:get("u")
+        u.nome = "Bia"
+        t.eq(a.state:get("u").nome, "Ana")
+        t.is_error(a.state:set("f", function() end), "not JSON-serializable")
+        a.state:delete("n")
+        t.is_nil(a.state:get("n"))
+    end)
+
+    t.it("invocation_state reaches tools and hooks", function()
+        local seen = nil
+        local tool = strands.tool({name = "who", fn = function(_, ctx) seen = ctx.invocation_state.user end})
+        local a = agent(scripted([{tool = "who", input = {}}, "ok"]), {tools = [tool]})
+        t.no_error(a:invoke("x", {state = {user = "ana"}}))
+        t.eq(seen, "ana")
+    end)
+end)

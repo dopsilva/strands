@@ -208,14 +208,7 @@ function Summ.reduce_context(self, agent, err)
     -- a user message must not follow another: merge the summary into it
     if len(msgs) > 1 and msgs[1].role == "user" and not has_tool_result(msgs[1]) then
         for _, b in msgs[1].content do sm.content[] = b end
-        drop_first(msgs, 1)
-        msgs[] = sm
-        local k = len(msgs) - 1
-        while k > 0 do
-            msgs[k] = msgs[k - 1]
-            k -= 1
-        end
-        msgs[0] = sm
+        del msgs[1]
     end
     self.summary_message = sm
     self.removed_message_count += cut

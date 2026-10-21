@@ -1,0 +1,137 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- The OpenAI-compatible provider (Maritaca's) against a local fake server.
+
+local t = require("sea/test")
+local strands = require("../strands")
+local http = require("../../sea_vm/libs/http/http")
+
+local function chunk(delta, finish)
+    local ch = {}
+    ch.delta = delta
+    if finish ~= nil then ch.finish_reason = finish end
+    return {choices = [ch]}
+end
+
+-- a server that plays back a list of replies: {status, body} or {chunks = [...]}
+local function fake_server(replies)
+    local s = {}
+    s.requests = []
+    s.n = 0
+    s.srv = http.listen(0, function(req)
+        s.requests[] = {headers = req.headers, body = req:json(), path = req.path}
+        local r = replies[s.n]
+        s.n += 1
+        if r.chunks == nil then return {status = r.status or 200, body = r.body or "{}"} end
+        return {
+            status = 200, headers = {["Content-Type"] = "text/event-stream"},
+            stream = function(write)
+                for _, c in r.chunks do write("data: " .. json.encode(c) .. "\n\n") end
+                write("data: [DONE]\n\n")
+            end,
+        }
+    end)
+    s.url = `http://127.0.0.1:${s.srv.port}/api`
+    return s
+end
+
+local function model(s, opts)
+    local o = {}
+    o.base_url = s.url
+    o.api_key = "k"
+    o.model_id = "sabia-4"
+    for k, v in opts or {} do o[k] = v end
+    return strands.models.maritaca(o)
+end
+
+t.describe("OpenAI-compatible provider", function()
+    t.it("streams text and tool calls split across chunks", function()
+        local s = fake_server([
+            {
+                chunks = [
+                    chunk({role = "assistant", content = "Vou "}),
+                    chunk({content = "somar."}),
+                    chunk({tool_calls = [{index = 0, id = "c1", function = {name = "add", arguments = "{\"a\":"}}]}),
+                    chunk({tool_calls = [{index = 0, function = {arguments = "2,\"b\":3}"}}]}),
+                    chunk({tool_calls = [{index = 1, id = "c2", function = {name = "add", arguments = "{\"a\":1,\"b\":1}"}}]}),
+                    chunk({}, "tool_calls"),
+                    {choices = [], usage = {prompt_tokens = 11, completion_tokens = 7, total_tokens = 18}},
+                ],
+            },
+            {chunks = [chunk({content = "5 e 2"}, "stop")]},
+        ])
+        local add = strands.tool({name = "add", inputs = {a = "number", b = "number"}, fn = function(i) return i.a + i.b end})
+        local deltas = []
+        local a = t.no_error(strands.agent({
+            model = model(s), tools = [add], system_prompt = "Seja breve.",
+            callback_handler = function(e) if e.data then deltas[] = e.data end end,
+        }))
+        local r = t.no_error(a:invoke("some"))
+        s.srv.close()
+        t.eq(r.text, "5 e 2")
+        t.eq(deltas, ["Vou ", "somar.", "5 e 2"])
+        t.eq(r.usage.totalTokens, 18)
+        local req1 = s.requests[0]
+        t.eq(req1.path, "/api/chat/completions")
+        t.eq(req1.headers["authorization"], "Bearer k")
+        t.eq(req1.body.model, "sabia-4")
+        t.eq(req1.body.stream, true)
+        t.eq(req1.body.messages[0], {role = "system", content = "Seja breve."})
+        t.eq(req1.body.tools[0]["function"].name, "add")
+        local m2 = s.requests[1].body.messages
+        t.eq(m2[2].tool_calls[0].id, "c1")
+        t.eq(json.decode(m2[2].tool_calls[0]["function"].arguments), {a = 2, b = 3})
+        t.eq(m2[3], {role = "tool", tool_call_id = "c1", content = "5"})
+        t.eq(m2[4].tool_call_id, "c2")
+    end)
+
+    t.it("maps HTTP errors to kinds and retries throttling", function()
+        local s = fake_server([
+            {status = 429, body = "{\"error\": {\"message\": \"rate limit\"}}"},
+            {chunks = [chunk({content = "ok"}, "stop")]},
+            {status = 400, body = "{\"error\": {\"message\": \"This model's maximum context length is 128000 tokens\"}}"},
+            {status = 401, body = "{\"detail\": \"Not authenticated\"}"},
+        ])
+        local m = model(s)
+        local a = t.no_error(strands.agent({
+            model = m, callback_handler = false, conversation_manager = strands.conversation.null(),
+            retry = {max_attempts = 2, initial_delay_ms = 1},
+        }))
+        t.eq(t.no_error(a:invoke("x")).text, "ok")
+        local e = a:invoke("y")
+        t.eq(strands.error_kind(e), "context_window_overflow")
+        local e2 = a:invoke("z")
+        t.eq(strands.error_kind(e2), "model")
+        t.contains(e2.message, "Not authenticated")
+        s.srv.close()
+    end)
+
+    t.it("works without streaming and sends images and params", function()
+        local s = fake_server([
+            {
+                status = 200, body = json.encode({
+                    choices = [{message = {content = "vi uma imagem"}, finish_reason = "stop"}],
+                    usage = {prompt_tokens = 3, completion_tokens = 2, total_tokens = 5},
+                }),
+            },
+        ])
+        local a = t.no_error(strands.agent({model = model(s, {stream = false, params = {temperature = 0.2, max_tokens = 100}}), callback_handler = false}))
+        local img = {image = {format = "png", source = {bytes = "\x89PNG"}}}
+        local r = t.no_error(a:invoke([strands.messages.text_block("o que é?"), img]))
+        s.srv.close()
+        t.eq(r.text, "vi uma imagem")
+        local body = s.requests[0].body
+        t.is_nil(body.stream)
+        t.eq(body.temperature, 0.2)
+        t.eq(body.max_tokens, 100)
+        t.eq(body.messages[0].content[1].type, "image_url")
+        t.matches(body.messages[0].content[1].image_url.url, "^data:image/png;base64,")
+    end)
+
+    t.it("needs an API key", function()
+        local m = strands.models.openai({base_url = "http://127.0.0.1:1", api_key = nil})
+        local a = t.no_error(strands.agent({model = m, callback_handler = false}))
+        t.is_error(a:invoke("x"), "missing API key")
+    end)
+end)
