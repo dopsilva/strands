@@ -24,8 +24,16 @@ O projeto usa o binário `sea` e a biblioteca `http` do checkout do sea_vm ao la
 make -C ~/projects/sea_vm
 make -C ~/projects/sea_vm/libs/http
 make -C ~/projects/sea_vm/libs/ssl
-export MARITACA_API_KEY=...        # https://plataforma.maritaca.ai
 ```
+
+A chave da Maritaca ([plataforma.maritaca.ai](https://plataforma.maritaca.ai)) vai no arquivo `.env` da raiz do projeto. Ele fica fora do git, e o `.env.example` mostra as opções:
+
+```sh
+MARITACA_API_KEY=sua-chave
+MARITACA_MODEL=sabia-4
+```
+
+A CLI lê o `.env` do diretório atual e o do projeto, e os exemplos leem o mais próximo, com `require("sea/dotenv")`. Uma variável já definida no ambiente vale mais que o arquivo. Num programa seu: `require("sea/dotenv").load()?`.
 
 | Comando | O que faz |
 | --- | --- |
