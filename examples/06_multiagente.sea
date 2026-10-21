@@ -41,9 +41,13 @@ print(rs.text)
 -- 3. grafo: etapas com dependências; as independentes rodam em paralelo
 common.title("Grafo")
 local b = strands.graph_builder()
-b:add_node(agente("coleta", "", "Liste dados.", ["Vendas: jan 100, fev 120, mar 150."])?, "coleta")
-b:add_node(agente("tendencia", "", "Analise a tendência.", ["Crescimento de 50% no trimestre."])?, "tendencia")
-b:add_node(agente("riscos", "", "Aponte riscos.", ["Risco: dependência de poucos clientes."])?, "riscos")
+local SO_DADOS = " Use só os dados recebidos, sem inventar nem pedir outros. Responda em no máximo três frases, sem títulos."
+b:add_node(agente("coleta", "", "Organize os dados de vendas recebidos: total do trimestre e variação de cada mês em relação ao anterior." .. SO_DADOS,
+    ["Total: R$ 370 mil. Fevereiro cresceu 20% sobre janeiro e março 25% sobre fevereiro; o cliente Alfa respondeu por 60% de março."])?, "coleta")
+b:add_node(agente("tendencia", "", "Descreva a tendência das vendas a partir dos dados organizados." .. SO_DADOS,
+    ["As vendas crescem de forma acelerada: 50% de janeiro a março."])?, "tendencia")
+b:add_node(agente("riscos", "", "Aponte o principal risco que os dados mostram." .. SO_DADOS,
+    ["O risco é a concentração: um único cliente fez 60% das vendas de março."])?, "riscos")
 b:add_node(function(entrada, estado)
     -- um nó também pode ser uma função
     return `Relatório final:\n- ${estado.results.tendencia.text}\n- ${estado.results.riscos.text}`
@@ -52,6 +56,7 @@ b:add_edge("coleta", "tendencia")
 b:add_edge("coleta", "riscos")
 b:add_edge("tendencia", "relatorio")
 local g = b:build()?
-local rg = g:invoke("Analise as vendas do trimestre")
+local rg = g:invoke("Analise as vendas do trimestre. Vendas: janeiro R$ 100 mil, fevereiro R$ 120 mil, março R$ 150 mil. " ..
+    "Em março, o cliente Alfa comprou R$ 90 mil.")
 print(`${rg.status}: ${string.join(rg.execution_order, ", ")}`)
 print(rg.text)
