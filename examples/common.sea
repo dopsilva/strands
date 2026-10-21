@@ -6,10 +6,18 @@
 -- example also runs offline).
 
 local strands = require("../strands")
+local dotenv = require("sea/dotenv")
 
 local M = {}
 
-M.online = os.getenv("MARITACA_API_KEY") ~= nil
+-- the project's .env (examples run from the root or from examples/)
+local env_file = dotenv.find(".env")
+if env_file ~= nil then
+    local loaded = dotenv.load(env_file)
+    if is_error(loaded) then panic(loaded.message) end
+end
+
+M.online = (os.getenv("MARITACA_API_KEY") or "") ~= ""
 
 function M.model(offline_answers, opts)
     if M.online then return strands.models.maritaca(opts) end

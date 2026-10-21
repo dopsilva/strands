@@ -11,10 +11,25 @@
 -- Flags: --model NAME, --session ID, --no-session, --no-tools, --yes (run
 -- shell commands and writes without asking), --mcp "command" (repeatable:
 -- an MCP server over stdio), --system TEXT, --workdir DIR, --quiet (no tool
--- lines), --max-turns N. The key comes from MARITACA_API_KEY.
+-- lines), --max-turns N. The key comes from MARITACA_API_KEY, in the
+-- environment or in a .env file (see .env.example).
 -- bin/strands is a wrapper: bin/strands chat.
 
 local flags = require("sea/flags")
+local dotenv = require("sea/dotenv")
+
+-- settings from .env: the current directory's, then this project's (the
+-- environment wins over both)
+for _, env_file in [".env", path.join(path.dirname(path.abs(os.script)), ".env")] do
+    if fs.isfile(env_file) then
+        local loaded = dotenv.load(env_file)
+        if is_error(loaded) then
+            io.write_err(`strands: ${loaded.message}\n`)
+            os.exit(1)
+        end
+    end
+end
+
 local strands = require("./strands")
 local harness = require("./lib/harness")
 local maritaca = require("./lib/models/maritaca")
@@ -112,8 +127,8 @@ local function terminal_handler()
     end
 end
 
-if os.getenv("MARITACA_API_KEY") == nil then
-    io.write_err("strands: set MARITACA_API_KEY (https://plataforma.maritaca.ai)\n")
+if (os.getenv("MARITACA_API_KEY") or "") == "" then
+    io.write_err("strands: set MARITACA_API_KEY in the environment or in .env (https://plataforma.maritaca.ai)\n")
     stop_mcp()
     os.exit(1)
 end
