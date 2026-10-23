@@ -14,7 +14,8 @@ local function chunk(delta, finish)
     return {choices = [ch]}
 end
 
--- a server that plays back a list of replies: {status, body} or {chunks = [...]}
+-- a server that plays back a list of replies: {status, body} or {chunks =
+-- [...], delay_ms} (delay_ms between chunks: a slow answer)
 local function fake_server(replies)
     local s = {}
     s.requests = []
@@ -27,7 +28,10 @@ local function fake_server(replies)
         return {
             status = 200, headers = {["Content-Type"] = "text/event-stream"},
             stream = function(write)
-                for _, c in r.chunks do write("data: " .. json.encode(c) .. "\n\n") end
+                for _, c in r.chunks do
+                    write("data: " .. json.encode(c) .. "\n\n")
+                    if r.delay_ms ~= nil then time.sleep(r.delay_ms * time.Millisecond) end
+                end
                 write("data: [DONE]\n\n")
             end,
         }
@@ -127,6 +131,26 @@ t.describe("OpenAI-compatible provider", function()
         t.eq(body.max_tokens, 100)
         t.eq(body.messages[0].content[1].type, "image_url")
         t.matches(body.messages[0].content[1].image_url.url, "^data:image/png;base64,")
+    end)
+
+    t.it("stops reading a streaming answer when the agent is cancelled", function()
+        local slow = []
+        for i = 1, 20 do slow[] = chunk({content = `parte ${i} `}) end
+        slow[] = chunk({}, "stop")
+        local s = fake_server([{chunks = slow, delay_ms = 100}])
+        local a = nil
+        a = t.no_error(strands.agent({
+            model = model(s),
+            callback_handler = function(e)
+                -- the first piece of text: the user pressed stop
+                if e.data ~= nil then a:cancel() end
+            end,
+        }))
+        local t0 = time.now()
+        local r = t.no_error(a:invoke("conta até vinte"))
+        t.eq(r.stop_reason, "cancelled")
+        t.ok(time.since(t0) < 1000 * time.Millisecond) -- not the whole 2 s answer
+        s.srv.close()
     end)
 
     t.it("needs an API key", function()

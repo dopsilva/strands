@@ -394,6 +394,9 @@ function Model.stream(self, req, emit)
     local buf = ""
     local failed = nil
     local finished = false
+    -- agent:cancel() while the answer streams: stop reading it (checked as
+    -- each piece arrives)
+    local stopped = false
     local function on_line(line)
         if not string.starts_with(line, "data:") then return end
         local payload = string.trim(string.sub(line, 6))
@@ -415,6 +418,10 @@ function Model.stream(self, req, emit)
         headers = headers,
         timeout = self.timeout,
         on_data = function(piece)
+            if req.cancelled ~= nil and req.cancelled() then
+                stopped = true
+                return false
+            end
             buf ..= piece
             while true do
                 local nl = string.find(buf, "\n")
@@ -427,6 +434,7 @@ function Model.stream(self, req, emit)
             end
         end,
     })
+    if stopped then return util.err("cancelled", "the agent was cancelled") end
     if not resp.ok then return http_error(self, resp) end
     if buf ~= "" and failed == nil and not finished then on_line(buf) end
     if failed ~= nil then return failed end
