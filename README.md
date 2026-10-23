@@ -18,7 +18,7 @@ print(r.text)
 
 ## Instalação
 
-O projeto usa o binário `sea` e a biblioteca `http` do checkout do sea_vm ao lado (`~/projects/sea_vm`). Se as bibliotecas estiverem em outro lugar, mude o caminho em `lib/deps.sea`. A biblioteca `http` precisa estar compilada:
+O projeto usa o binário `sea` e a biblioteca `http`, carregada pelo nome (`require("http")`): um `sea` instalado (`make install`) acha as bibliotecas em `lib/sea/`, e o `bin/sea` do checkout do sea_vm acha em `libs/`. O `bin/strands` usa o `sea` do PATH ou, sem ele, o do checkout ao lado (`~/projects/sea_vm`). A biblioteca `http` precisa estar compilada:
 
 ```sh
 make -C ~/projects/sea_vm

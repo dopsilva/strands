@@ -5,7 +5,7 @@
 
 local t = require("sea/test")
 local strands = require("../strands")
-local http = require("../../sea_vm/libs/http/http")
+local http = require("http")
 
 local function chunk(delta, finish)
     local ch = {}
