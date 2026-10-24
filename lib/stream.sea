@@ -14,7 +14,7 @@
 --   {contentBlockDelta = {delta = {reasoningContent = {text, signature}}}}
 --   {contentBlockStop = {}}
 --   {messageStop = {stopReason = "end_turn" | "tool_use" | "max_tokens" | ...}}
---   {metadata = {usage = {inputTokens, outputTokens, totalTokens}, metrics = {latencyMs}}}
+--   {metadata = {usage = {inputTokens, outputTokens, totalTokens, cacheReadInputTokens}, metrics = {latencyMs}}}
 -- The collector builds the assistant message from them and reports the
 -- progress to a callback, as Strands' callback handlers receive it:
 --   {data = "text delta", delta = {...}}
@@ -40,6 +40,7 @@ function M.collector(callback)
     c.usage.inputTokens = 0
     c.usage.outputTokens = 0
     c.usage.totalTokens = 0
+    c.usage.cacheReadInputTokens = 0
     c.metrics = {}
     c.block = nil -- the open block: {kind = "text"|"tool"|"reasoning", ...}
     c.started = util.now_ms()
@@ -148,6 +149,7 @@ function Collector.on_event(self, ev)
             self.usage.inputTokens += u.inputTokens or 0
             self.usage.outputTokens += u.outputTokens or 0
             self.usage.totalTokens += u.totalTokens or ((u.inputTokens or 0) + (u.outputTokens or 0))
+            self.usage.cacheReadInputTokens += u.cacheReadInputTokens or 0
         end
         if ev.metadata.metrics ~= nil then
             for k, v in ev.metadata.metrics do self.metrics[k] = v end

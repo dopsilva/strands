@@ -319,6 +319,9 @@ local function converter(emit)
             u.inputTokens = s.usage.prompt_tokens or 0
             u.outputTokens = s.usage.completion_tokens or 0
             u.totalTokens = s.usage.total_tokens or (u.inputTokens + u.outputTokens)
+            -- the part of the input the provider served from its prompt cache
+            local details = s.usage.prompt_tokens_details
+            u.cacheReadInputTokens = type(details) == "table" and (details.cached_tokens or 0) or 0
             local md = {}
             md.usage = u
             emit(ev1("metadata", md))

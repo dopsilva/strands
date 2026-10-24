@@ -60,7 +60,8 @@ t.describe("OpenAI-compatible provider", function()
                     chunk({tool_calls = [{index = 0, function = {arguments = "2,\"b\":3}"}}]}),
                     chunk({tool_calls = [{index = 1, id = "c2", function = {name = "add", arguments = "{\"a\":1,\"b\":1}"}}]}),
                     chunk({}, "tool_calls"),
-                    {choices = [], usage = {prompt_tokens = 11, completion_tokens = 7, total_tokens = 18}},
+                    {choices = [], usage = {prompt_tokens = 11, completion_tokens = 7, total_tokens = 18,
+                        prompt_tokens_details = {cached_tokens = 8}}},
                 ],
             },
             {chunks = [chunk({content = "5 e 2"}, "stop")]},
@@ -76,6 +77,7 @@ t.describe("OpenAI-compatible provider", function()
         t.eq(r.text, "5 e 2")
         t.eq(deltas, ["Vou ", "somar.", "5 e 2"])
         t.eq(r.usage.totalTokens, 18)
+        t.eq(r.usage.cacheReadInputTokens, 8)   -- the provider's prompt cache (the second call reports none)
         local req1 = s.requests[0]
         t.eq(req1.path, "/api/chat/completions")
         t.eq(req1.headers["authorization"], "Bearer k")

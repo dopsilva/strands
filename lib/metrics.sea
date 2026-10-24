@@ -18,6 +18,7 @@ function M.new()
     u.inputTokens = 0
     u.outputTokens = 0
     u.totalTokens = 0
+    u.cacheReadInputTokens = 0
     m.accumulated_usage = u
     local am = {}
     am.latencyMs = 0
@@ -33,6 +34,7 @@ function Metrics.add_usage(self, usage, metrics)
         self.accumulated_usage.inputTokens += usage.inputTokens or 0
         self.accumulated_usage.outputTokens += usage.outputTokens or 0
         self.accumulated_usage.totalTokens += usage.totalTokens or 0
+        self.accumulated_usage.cacheReadInputTokens += usage.cacheReadInputTokens or 0
     end
     if metrics ~= nil and metrics.latencyMs ~= nil then
         self.accumulated_metrics.latencyMs += metrics.latencyMs

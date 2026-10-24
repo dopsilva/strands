@@ -105,7 +105,7 @@ Campos do resultado:
 | `stop_reason` | Por que parou: `end_turn`, `limit_turns`, `limit_total_tokens`, `cancelled` ou `interrupt` |
 | `message` | A última mensagem do assistente |
 | `reasoning` | O texto de raciocínio, quando o modelo envia (`sabia-4-thinking`) |
-| `usage` | Tokens de entrada, de saída e o total |
+| `usage` | Tokens de entrada, de saída e o total; `cacheReadInputTokens`: os de entrada que o provedor serviu do cache de prompt |
 | `metrics` | Ciclos, latência, uso de cada ferramenta e um trace de spans |
 | `interrupts` | As interrupções pendentes, quando `stop_reason` é `interrupt` |
 | `structured_output` | O valor validado, quando a invocação pediu saída estruturada |
